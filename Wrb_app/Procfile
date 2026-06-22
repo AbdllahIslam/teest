@@ -1,1 +1,1 @@
-web: gunicorn -k sync -w 1 server:app --timeout 120
+web: gunicorn -k eventlet -w 1 server:app --timeout 120

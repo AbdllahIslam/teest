@@ -3,5 +3,6 @@ flask-cors
 flask-socketio
 numpy
 h5py
-tensorflow
+eventlet
+tensorflow-cpu==2.11.0
 gunicorn
