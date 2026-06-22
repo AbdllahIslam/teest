@@ -1,0 +1,114 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>SignAI Meet</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div class="background-art">
+    <div class="orb orb-one"></div>
+    <div class="orb orb-two"></div>
+    <div class="orb orb-three"></div>
+    <div class="grid-overlay"></div>
+  </div>
+
+  <header class="navbar">
+    <div class="brand">
+      <div class="logo">SA</div>
+      <div>
+        <span>SignAI Meet</span>
+        <small>Sign recognition meeting room</small>
+      </div>
+    </div>
+
+    <div class="room-bar">
+      <label class="room-field">
+        <span>Room code</span>
+        <input id="roomInput" type="text" placeholder="team-room" autocomplete="off" />
+      </label>
+      <button id="joinRoomBtn" class="join-btn" type="button">Join</button>
+      <button id="leaveRoomBtn" class="ghost-btn" type="button">Leave</button>
+      <button id="themeToggleBtn" class="theme-toggle" type="button">Dark mode</button>
+    </div>
+  </header>
+
+  <main class="meeting-shell">
+    <section class="stage-panel">
+      <div class="stage-header">
+        <div>
+          <p class="eyebrow">Live meeting</p>
+          <h1>Sign translation with room audio and video</h1>
+        </div>
+        <div class="stage-metrics">
+          <div class="stage-pill" id="connectionPill">Disconnected</div>
+          <div class="stage-pill participants-pill" id="participantsPill">Participants: 0</div>
+        </div>
+      </div>
+
+      <div class="participant-grid">
+        <article class="participant-tile local-tile">
+          <div class="tile-badge">
+            <span class="live-dot"></span>
+            You
+          </div>
+          <video id="localVideo" autoplay playsinline muted></video>
+          <canvas id="canvas"></canvas>
+          <div class="participant-meta">
+            <div>
+              <div class="participant-name">You</div>
+              <div class="participant-state" id="localStatus">Ready</div>
+            </div>
+            <div class="participant-word" id="localDetectedWord">Waiting for a sign</div>
+          </div>
+        </article>
+
+        <div id="remoteVideos" class="remote-grid" aria-live="polite"></div>
+      </div>
+
+      <div class="meeting-controls">
+        <button id="cameraBtn" class="control-btn primary-control" type="button">Turn camera on</button>
+      </div>
+    </section>
+
+    <aside class="side-panel">
+      <section class="panel transcript-panel">
+        <div class="panel-head">
+          <div>
+            <p class="eyebrow">Live transcript</p>
+            <h2>Recognized words</h2>
+          </div>
+        </div>
+
+        <div id="chatBox" class="transcript-box" aria-live="polite"></div>
+        <p id="status" class="status-text">Allow camera access to start recognition.</p>
+      </section>
+
+      <section class="panel tips-panel">
+        <p class="eyebrow">Room tips</p>
+        <ul>
+          <li>Use the same room code to join the same meeting.</li>
+          <li>Keep one hand clearly inside the camera frame for best recognition.</li>
+          <li>The transcript updates automatically when a sign is stable enough.</li>
+        </ul>
+      </section>
+    </aside>
+  </main>
+
+  <footer class="footer">
+    <div class="brand small-brand">
+      <div class="logo">SA</div>
+      <span>SignAI Meet</span>
+    </div>
+    <p>Custom sign recognition meeting room.</p>
+  </footer>
+
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/pose/pose.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js"></script>
+  <script src="https://cdn.socket.io/4.5.4/socket.io.min.js"></script>
+  <script src="multi.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

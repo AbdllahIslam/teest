@@ -1,0 +1,7 @@
+flask
+flask-cors
+flask-socketio
+numpy
+h5py
+tensorflow
+gunicorn

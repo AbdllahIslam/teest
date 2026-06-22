@@ -1,0 +1,234 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+
+  <title>SignAI</title>
+
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div class="background-art">
+    <div class="orb orb-one"></div>
+    <div class="orb orb-two"></div>
+    <div class="orb orb-three"></div>
+    <div class="grid-overlay"></div>
+  </div>
+
+  <header class="navbar">
+    <div class="brand">
+      <div class="logo">SA</div>
+      <div>
+        <span>SignAI</span>
+        <small>Custom LSTM Translator</small>
+      </div>
+    </div>
+
+    <nav class="nav-links">
+      <button class="nav-btn active" data-page="home">Home</button>
+      <button class="nav-btn" data-page="camera">Camera</button>
+      <button class="nav-btn" data-page="about">About</button>
+    </nav>
+
+    <button class="start-btn" data-page="camera">Start Recognition</button>
+  </header>
+
+  <main>
+    <!-- HOME PAGE -->
+    <section id="home" class="page-section active">
+      <div class="hero artistic-hero">
+        <div class="hero-badge">REAL TIME SIGN RECOGNITION</div>
+
+        <h1>
+          AI that reads your<br />
+          <span>custom hand signs</span>
+        </h1>
+
+        <div class="gradient-line"></div>
+
+        <p>
+          A web-based sign language recognition system powered by your own
+          trained LSTM model and live MediaPipe hand tracking.
+        </p>
+
+        <div class="hero-buttons">
+          <button class="primary-btn" data-page="camera">Open Camera</button>
+          <button class="secondary-btn" data-page="about">Project Details</button>
+        </div>
+
+        <div class="stats">
+          <div class="stat-card">
+            <h2>83%</h2>
+            <p>Training Accuracy</p>
+          </div>
+
+          <div class="stat-card">
+            <h2>20</h2>
+            <p>Custom Signs</p>
+          </div>
+
+          <div class="stat-card">
+            <h2>15</h2>
+            <p>Frames Per Prediction</p>
+          </div>
+        </div>
+
+        <h2 class="features-title">System Features</h2>
+
+        <div class="features">
+          <div class="feature-card artistic-card">
+            <div class="feature-icon">AI</div>
+            <h3>Custom Model</h3>
+            <p>
+              Uses your own dataset and your own trained LSTM model, not a public ASL model.
+            </p>
+          </div>
+
+          <div class="feature-card artistic-card">
+            <div class="feature-icon">RT</div>
+            <h3>Live Recognition</h3>
+            <p>
+              Processes webcam frames in real time using Pose and Hands landmarks.
+            </p>
+          </div>
+
+          <div class="feature-card artistic-card">
+            <div class="feature-icon">HUD</div>
+            <h3>Smart Display</h3>
+            <p>
+              Shows confidence, top predictions, hand boxes, and recognition status.
+            </p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- CAMERA PAGE -->
+    <section id="camera" class="page-section">
+      <div class="translator-card camera-art-card">
+        <div class="title-row">
+          <div class="logo large-logo">SA</div>
+
+          <div>
+            <h1>SignAI Camera</h1>
+            <p>Translate your custom signs from camera to text</p>
+          </div>
+        </div>
+
+        <div class="camera-frame-shell">
+          <div class="camera-top-strip">
+            <span class="live-dot"></span>
+            <span>Live Recognition</span>
+            <span class="camera-chip">Pose + Hands</span>
+          </div>
+
+          <div class="camera-screen">
+            <video id="webcam" autoplay playsinline></video>
+            <canvas id="canvas"></canvas>
+          </div>
+        </div>
+
+        <div class="control-row">
+          <button id="cameraBtn" class="dark-btn">Camera On</button>
+          <button id="backspaceBtn" class="light-btn">Backspace</button>
+        </div>
+
+        <div class="control-row small">
+          <button id="spaceBtn" class="light-btn">Space</button>
+          <button id="clearSentenceBtn" class="light-btn">Clear All</button>
+        </div>
+
+        <div class="chat-card artistic-chat">
+          <div class="chat-header">
+            <div>
+              <h3>Recognized Sentence</h3>
+              <p>Words accepted by the model will appear below</p>
+            </div>
+
+            <button id="clearChatBtn" class="light-btn">Clear Chat</button>
+          </div>
+
+          <div id="chatBox" class="chat-box"></div>
+
+          <div class="input-row">
+            <input
+              id="sentenceInput"
+              type="text"
+              placeholder="Recognized word will appear here"
+            />
+
+            <button id="sendBtn" class="send-btn">Send</button>
+          </div>
+
+          <p id="status">Please allow camera access</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- ABOUT PAGE -->
+    <section id="about" class="page-section">
+      <div class="about-card artistic-about">
+        <div class="hero-badge">PROJECT PIPELINE</div>
+
+        <h1>About SignAI</h1>
+
+        <p>
+          SignAI is a custom sign recognition website. It uses the browser camera,
+          extracts Pose and Hands landmarks, sends 15 frames to the Flask backend,
+          and your LSTM model predicts one of your trained custom signs.
+        </p>
+
+        <div class="about-grid">
+          <div>
+            <h3>Model Input</h3>
+            <p>15 frames × 225 features</p>
+          </div>
+
+          <div>
+            <h3>Landmarks</h3>
+            <p>Pose + left hand + right hand</p>
+          </div>
+
+          <div>
+            <h3>Backend</h3>
+            <p>Flask + TensorFlow model prediction</p>
+          </div>
+        </div>
+
+        <div class="pipeline">
+          <div class="pipeline-step">Camera</div>
+          <span></span>
+          <div class="pipeline-step">MediaPipe</div>
+          <span></span>
+          <div class="pipeline-step">LSTM</div>
+          <span></span>
+          <div class="pipeline-step">Text</div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    <div class="brand small-brand">
+      <div class="logo">SA</div>
+      <span>SignAI</span>
+    </div>
+
+    <div class="footer-links">
+      <button class="nav-btn" data-page="home">Home</button>
+      <button class="nav-btn" data-page="camera">Camera</button>
+      <button class="nav-btn" data-page="about">About</button>
+    </div>
+
+    <p>© 2026 SignAI. Custom sign recognition project.</p>
+  </footer>
+
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/pose/pose.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js"></script>
+
+  <script src="app.js"></script>
+</body>
+</html>
