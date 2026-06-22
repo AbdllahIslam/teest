@@ -4,5 +4,5 @@ flask-socketio
 numpy
 h5py
 eventlet
-tensorflow-cpu==2.11.0
+tensorflow-cpu==2.21.0
 gunicorn
