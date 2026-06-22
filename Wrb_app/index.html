@@ -3,7 +3,9 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>SignAI Meet</title>
+
+  <title>SignAI</title>
+
   <link rel="stylesheet" href="styles.css" />
 </head>
 <body>
@@ -18,97 +20,313 @@
     <div class="brand">
       <div class="logo">SA</div>
       <div>
-        <span>SignAI Meet</span>
-        <small>Sign recognition meeting room</small>
+        <span>SignAI</span>
+        <small>Custom Sign Recognition</small>
       </div>
     </div>
 
-    <div class="room-bar">
-      <label class="room-field">
-        <span>Room code</span>
-        <input id="roomInput" type="text" placeholder="team-room" autocomplete="off" />
-      </label>
-      <button id="joinRoomBtn" class="join-btn" type="button">Join</button>
-      <button id="leaveRoomBtn" class="ghost-btn" type="button">Leave</button>
-      <button id="themeToggleBtn" class="theme-toggle" type="button">Dark mode</button>
-    </div>
+    <nav class="nav-links">
+      <button class="nav-btn active" data-page="home">Home</button>
+      <button class="nav-btn" data-page="camera">Camera</button>
+      <button class="nav-btn" data-page="about">About</button>
+    </nav>
+
+    <button class="start-btn" data-page="camera">Start Recognition</button>
   </header>
 
-  <main class="meeting-shell">
-    <section class="stage-panel">
-      <div class="stage-header">
-        <div>
-          <p class="eyebrow">Live meeting</p>
-          <h1>Sign translation with room audio and video</h1>
+  <main>
+    <!-- HOME PAGE -->
+    <section id="home" class="page-section active">
+      <div class="hero artistic-hero">
+        <div class="hero-badge">CUSTOM SIGN RECOGNITION</div>
+
+        <h1>
+          Custom signs<br />
+          <span>converted to text</span>
+        </h1>
+
+        <div class="gradient-line"></div>
+
+        <p>
+          A web project trained on our own recorded signs. It uses MediaPipe
+          landmarks, a Flask backend, and an LSTM model to recognize a fixed
+          20-word custom vocabulary.
+        </p>
+
+        <div class="hero-buttons">
+          <button class="primary-btn" data-page="camera">Open Camera</button>
+          <button class="secondary-btn" data-page="about">Project Details</button>
         </div>
-        <div class="stage-metrics">
-          <div class="stage-pill" id="connectionPill">Disconnected</div>
-          <div class="stage-pill participants-pill" id="participantsPill">Participants: 0</div>
+
+        <div class="stats">
+          <div class="stat-card">
+            <h2>83%</h2>
+            <p>Training Accuracy</p>
+          </div>
+
+          <div class="stat-card">
+            <h2>20</h2>
+            <p>Custom Signs</p>
+          </div>
+
+          <div class="stat-card">
+            <h2>15</h2>
+            <p>Frames Per Prediction</p>
+          </div>
         </div>
-      </div>
 
-      <div class="participant-grid">
-        <article class="participant-tile local-tile">
-          <div class="tile-badge">
-            <span class="live-dot"></span>
-            You
+        <h2 class="features-title">System Features</h2>
+
+        <div class="features">
+          <div class="feature-card artistic-card">
+            <div class="feature-icon">01</div>
+            <h3>Custom Dataset</h3>
+            <p>
+              The model was trained using our own recorded videos, not a public ASL dataset.
+            </p>
           </div>
-          <video id="localVideo" autoplay playsinline muted></video>
-          <canvas id="canvas"></canvas>
-          <div class="participant-meta">
-            <div>
-              <div class="participant-name">You</div>
-              <div class="participant-state" id="localStatus">Ready</div>
-            </div>
-            <div class="participant-word" id="localDetectedWord">Waiting for a sign</div>
+
+          <div class="feature-card artistic-card">
+            <div class="feature-icon">02</div>
+            <h3>Live Camera Input</h3>
+            <p>
+              The website reads webcam frames and extracts Pose and Hands landmarks.
+            </p>
           </div>
-        </article>
 
-        <div id="remoteVideos" class="remote-grid" aria-live="polite"></div>
-      </div>
-
-      <div class="meeting-controls">
-        <button id="cameraBtn" class="control-btn primary-control" type="button">Turn camera on</button>
+          <div class="feature-card artistic-card">
+            <div class="feature-icon">03</div>
+            <h3>Prediction Display</h3>
+            <p>
+              The result appears as text with confidence and prediction status.
+            </p>
+          </div>
+        </div>
       </div>
     </section>
 
-    <aside class="side-panel">
-      <section class="panel transcript-panel">
-        <div class="panel-head">
+    <!-- CAMERA PAGE -->
+    <section id="camera" class="page-section">
+      <div class="translator-card camera-art-card">
+        <div class="title-row">
+          <div class="logo large-logo">SA</div>
+
           <div>
-            <p class="eyebrow">Live transcript</p>
-            <h2>Recognized words</h2>
+            <h1>SignAI Camera</h1>
+            <p>Recognize the trained custom signs from camera input</p>
           </div>
         </div>
 
-        <div id="chatBox" class="transcript-box" aria-live="polite"></div>
-        <p id="status" class="status-text">Allow camera access to start recognition.</p>
-      </section>
+        <div class="camera-frame-shell">
+          <div class="camera-top-strip">
+            <span class="live-dot"></span>
+            <span>Live Recognition</span>
+            <span class="camera-chip">Pose + Hands</span>
+          </div>
 
-      <section class="panel tips-panel">
-        <p class="eyebrow">Room tips</p>
-        <ul>
-          <li>Use the same room code to join the same meeting.</li>
-          <li>Keep one hand clearly inside the camera frame for best recognition.</li>
-          <li>The transcript updates automatically when a sign is stable enough.</li>
-        </ul>
-      </section>
-    </aside>
+          <div class="camera-screen">
+            <video id="webcam" autoplay playsinline></video>
+            <canvas id="canvas"></canvas>
+          </div>
+        </div>
+
+        <div class="control-row">
+          <button id="cameraBtn" class="dark-btn">Camera On</button>
+          <button id="backspaceBtn" class="light-btn">Backspace</button>
+        </div>
+
+        <div class="control-row small">
+          <button id="spaceBtn" class="light-btn">Space</button>
+          <button id="clearSentenceBtn" class="light-btn">Clear All</button>
+        </div>
+
+        <div class="chat-card artistic-chat">
+          <div class="chat-header">
+            <div>
+              <h3>Recognized Sentence</h3>
+              <p>Accepted words will appear below</p>
+            </div>
+
+            <button id="clearChatBtn" class="light-btn">Clear Chat</button>
+          </div>
+
+          <div id="chatBox" class="chat-box"></div>
+
+          <div class="input-row">
+            <input
+              id="sentenceInput"
+              type="text"
+              placeholder="Recognized word will appear here"
+            />
+
+            <button id="sendBtn" class="send-btn">Send</button>
+          </div>
+
+          <p id="status">Please allow camera access</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- ABOUT PAGE -->
+    <section id="about" class="page-section">
+      <div class="about-card artistic-about about-full-card">
+        <div class="hero-badge">PROJECT OVERVIEW</div>
+
+        <h1>About SignAI</h1>
+
+        <p>
+          SignAI is a custom sign recognition website built for our recorded signs.
+          It uses the browser camera, extracts body and hand landmarks with MediaPipe,
+          sends 15 frames to the Flask backend, and the trained LSTM model predicts
+          one of the custom words.
+        </p>
+
+        <p class="disclaimer-text">
+          This project is not an ASL translator. It only recognizes the 20 custom
+          signs that were recorded and trained for this model.
+        </p>
+
+        <div class="about-grid">
+          <div>
+            <h3>Input</h3>
+            <p>15 frames × 225 features</p>
+          </div>
+
+          <div>
+            <h3>Tracking</h3>
+            <p>Pose + left hand + right hand</p>
+          </div>
+
+          <div>
+            <h3>Model</h3>
+            <p>LSTM custom sign classifier</p>
+          </div>
+        </div>
+
+        <div class="pipeline">
+          <div class="pipeline-step">Camera</div>
+          <span></span>
+          <div class="pipeline-step">MediaPipe</div>
+          <span></span>
+          <div class="pipeline-step">LSTM</div>
+          <span></span>
+          <div class="pipeline-step">Text</div>
+        </div>
+
+        <div class="about-inner-section">
+          <div class="hero-badge">CUSTOM TRAINED WORDS</div>
+
+          <h2 class="about-section-title">20-Word Custom Vocabulary</h2>
+
+          <p>
+            These are the only words the model was trained to recognize.
+          </p>
+
+          <div class="vocabulary-grid">
+            <div class="word-chip">baby</div>
+            <div class="word-chip">eat</div>
+            <div class="word-chip">father</div>
+            <div class="word-chip">finish</div>
+            <div class="word-chip">good</div>
+            <div class="word-chip">happy</div>
+            <div class="word-chip">hear</div>
+            <div class="word-chip">house</div>
+            <div class="word-chip">important</div>
+            <div class="word-chip">love</div>
+            <div class="word-chip">mall</div>
+            <div class="word-chip">me</div>
+            <div class="word-chip">mosque</div>
+            <div class="word-chip">mother</div>
+            <div class="word-chip">normal</div>
+            <div class="word-chip">sad</div>
+            <div class="word-chip">stop</div>
+            <div class="word-chip">thanks</div>
+            <div class="word-chip">thinking</div>
+            <div class="word-chip">worry</div>
+          </div>
+        </div>
+
+        <div class="about-inner-section">
+          <div class="hero-badge">MODEL RESULTS</div>
+
+          <h2 class="about-section-title">Training Results</h2>
+
+          <p>
+            These figures show the training history, classification report,
+            confusion matrix, and model structure.
+          </p>
+
+          <div class="metrics-gallery">
+            <div class="metric-card">
+              <button class="metric-image-box" type="button" aria-label="Open training history image">
+                <img src="assets/accuracy_loss.png" alt="Accuracy and loss graph">
+              </button>
+              <div class="metric-info">
+                <h3>Training History</h3>
+                <p>Accuracy and loss during training</p>
+              </div>
+            </div>
+
+            <div class="metric-card">
+              <button class="metric-image-box" type="button" aria-label="Open classification report image">
+                <img src="assets/classification_report.png" alt="Classification report">
+              </button>
+              <div class="metric-info">
+                <h3>Classification Report</h3>
+                <p>Precision, recall, and F1-score</p>
+              </div>
+            </div>
+
+            <div class="metric-card">
+              <button class="metric-image-box" type="button" aria-label="Open confusion matrix image">
+                <img src="assets/confusion_matrix.png" alt="Confusion matrix">
+              </button>
+              <div class="metric-info">
+                <h3>Confusion Matrix</h3>
+                <p>Predicted labels compared with actual labels</p>
+              </div>
+            </div>
+
+            <div class="metric-card">
+              <button class="metric-image-box" type="button" aria-label="Open model structure image">
+                <img src="assets/model_summary.png" alt="Model summary">
+              </button>
+              <div class="metric-info">
+                <h3>Model Structure</h3>
+                <p>LSTM layers and model parameters</p>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
   </main>
 
-  <footer class="footer">
+  <footer>
     <div class="brand small-brand">
       <div class="logo">SA</div>
-      <span>SignAI Meet</span>
+      <span>SignAI</span>
     </div>
-    <p>Custom sign recognition meeting room.</p>
+
+    <div class="footer-links">
+      <button class="nav-btn" data-page="home">Home</button>
+      <button class="nav-btn" data-page="camera">Camera</button>
+      <button class="nav-btn" data-page="about">About</button>
+    </div>
+
+    <p>© 2026 SignAI. Custom sign recognition project.</p>
   </footer>
 
+  <div id="imagePopup" class="image-popup" aria-hidden="true">
+    <button id="closePopup" class="popup-close" type="button" aria-label="Close image">×</button>
+    <img id="popupImage" src="" alt="Expanded metric image">
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/@mediapipe/pose/pose.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js"></script>
-  <script src="/socket.io/socket.io.js"></script>
-  <script src="multi.js"></script>
+
   <script src="app.js"></script>
 </body>
 </html>

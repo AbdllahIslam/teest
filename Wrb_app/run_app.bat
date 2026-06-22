@@ -1,3 +1,2 @@
-@echo off
-cd /d "%~dp0"
+cd C:\Users\Mr_Dth\Desktop\Project_col\Wrb_app
 python server.py

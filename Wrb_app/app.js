@@ -1,64 +1,54 @@
-const videoElement = document.getElementById("localVideo");
+const sections = document.querySelectorAll(".page-section");
+const navButtons = document.querySelectorAll("[data-page]");
+
+const videoElement = document.getElementById("webcam");
 const canvasElement = document.getElementById("canvas");
 const canvasCtx = canvasElement.getContext("2d");
 
 const cameraBtn = document.getElementById("cameraBtn");
+const backspaceBtn = document.getElementById("backspaceBtn");
+const spaceBtn = document.getElementById("spaceBtn");
+const clearSentenceBtn = document.getElementById("clearSentenceBtn");
+const clearChatBtn = document.getElementById("clearChatBtn");
+const sendBtn = document.getElementById("sendBtn");
+
+const sentenceInput = document.getElementById("sentenceInput");
 const chatBox = document.getElementById("chatBox");
 const statusElement = document.getElementById("status");
-const connectionPill = document.getElementById("connectionPill");
-const themeToggleBtn = document.getElementById("themeToggleBtn");
 
-const BACKEND_ORIGIN = (() => {
-  try {
-    const currentUrl = new URL(window.location.href);
-    const fromQuery = currentUrl.searchParams.get("backend");
-    const fromStorage = localStorage.getItem("signai-backend-url");
-    const resolved = fromQuery || fromStorage || window.location.origin;
-
-    if (fromQuery) {
-      localStorage.setItem("signai-backend-url", fromQuery);
-    }
-
-    return resolved.replace(/\/$/, "");
-  } catch (error) {
-    return window.location.origin;
-  }
-})();
-
-// Same shape as the Python model
+// Same shape as your Python model
 const SEQUENCE_LENGTH = 15;
 const NUM_FEATURES = 225;
 
-// Same camera style as the backend input
+// Same camera style as your good Python test
 const CAMERA_WIDTH = 640;
 const CAMERA_HEIGHT = 480;
 
+// One fixed model setting only
 const CONFIDENCE_THRESHOLD = 0.70;
 const MINIMUM_PREDICTION_MARGIN = 0.10;
+
+// Stability settings
 const REQUIRED_STABLE_PREDICTIONS = 3;
 const PREDICTION_QUEUE_SIZE = 5;
 const WORD_REPEAT_DELAY_MS = 1800;
 const PREDICTION_INTERVAL_MS = 450;
 
-let localStream = null;
-let cameraStarted = false;
-let cameraStartPromise = null;
-let recognitionLoopRunning = false;
-let frameBusy = false;
+let sequence = [];
 let isPredicting = false;
+let cameraStarted = false;
+let camera = null;
+
 let lastPredictionTime = 0;
 let lastAddedWord = "";
 let lastAddedTime = 0;
 
-let sequence = [];
-let predictionQueue = [];
 let pendingPrediction = {
   word: "",
   count: 0
 };
 
-let transcriptWords = [];
-let latestDetectedWord = "";
+let predictionQueue = [];
 
 let lastPredictionInfo = {
   top1: "--",
@@ -71,221 +61,57 @@ let lastPredictionInfo = {
   accepted: false
 };
 
+// Hidden canvas for processing.
+// This mimics Python: frame = cv2.flip(frame, 1)
 const processCanvas = document.createElement("canvas");
 processCanvas.width = CAMERA_WIDTH;
 processCanvas.height = CAMERA_HEIGHT;
 const processCtx = processCanvas.getContext("2d");
 
-const THEME_STORAGE_KEY = "signai-theme";
 
-function applyTheme(theme) {
-  const isDark = theme === "dark";
-  document.body.classList.toggle("theme-dark", isDark);
+// =========================
+// PAGE NAVIGATION
+// =========================
 
-  if (themeToggleBtn) {
-    themeToggleBtn.textContent = isDark ? "Light mode" : "Dark mode";
-    themeToggleBtn.setAttribute("aria-pressed", String(isDark));
+function showPage(pageId) {
+  sections.forEach((section) => {
+    section.classList.remove("active");
+  });
+
+  const page = document.getElementById(pageId);
+
+  if (page) {
+    page.classList.add("active");
   }
 
-  try {
-    localStorage.setItem(THEME_STORAGE_KEY, theme);
-  } catch (error) {
-    // Ignore storage failures in private/incognito sessions.
-  }
-}
+  document.querySelectorAll(".nav-btn").forEach((btn) => {
+    btn.classList.remove("active");
 
-function initTheme() {
-  let theme = "light";
-
-  try {
-    theme = localStorage.getItem(THEME_STORAGE_KEY) || "light";
-  } catch (error) {
-    theme = "light";
-  }
-
-  if (theme !== "light" && theme !== "dark") {
-    theme = "light";
-  }
-
-  applyTheme(theme);
-}
-
-initTheme();
-n// Quick backend health check to help debug hosted failures. Shows model load / connectivity state.
-async function checkBackendHealth() {
-  try {
-    const res = await fetch(`${BACKEND_ORIGIN}/health`, { cache: "no-store" });
-    if (!res.ok) {
-      showStatus(`Backend health check failed: ${res.status}`);
-      return;
+    if (btn.dataset.page === pageId) {
+      btn.classList.add("active");
     }
-    const info = await res.json();
-    if (info && info.ok && info.model_loaded) {
-      showStatus("Backend OK. Model loaded.");
-    } else if (info && info.ok) {
-      showStatus("Backend OK but model not loaded.");
-    } else {
-      showStatus("Backend unreachable or unhealthy.");
-    }
-  } catch (err) {
-    console.warn("Health check failed:", err);
-    showStatus("Could not connect to backend. Ensure server is running on the same origin or provide ?backend=URL");
-  }
-}
-
-checkBackendHealth();
-
-if (themeToggleBtn) {
-  themeToggleBtn.addEventListener("click", () => {
-    const nextTheme = document.body.classList.contains("theme-dark") ? "light" : "dark";
-    applyTheme(nextTheme);
   });
 }
 
-function updateConnectionPill(text) {
-  if (connectionPill) {
-    connectionPill.textContent = text;
-  }
-}
 
-function renderTranscript() {
-  if (!chatBox) {
-    return;
-  }
-
-  chatBox.innerHTML = "";
-
-  if (transcriptWords.length === 0) {
-    const placeholder = document.createElement("div");
-    placeholder.className = "chat-message";
-    placeholder.textContent = "Recognized words will appear here.";
-    chatBox.appendChild(placeholder);
-    return;
-  }
-
-  transcriptWords.forEach((word) => {
-    const message = document.createElement("div");
-    message.className = "chat-message";
-    message.textContent = word;
-    chatBox.appendChild(message);
+navButtons.forEach((button) => {
+  button.addEventListener("click", () => {
+    showPage(button.dataset.page);
   });
+});
 
-  chatBox.scrollTop = chatBox.scrollHeight;
-}
 
-renderTranscript();
-updateDetectedWord("");
-
-function updateDetectedWord(word, broadcast = false) {
-  latestDetectedWord = word || "";
-
-  if (typeof window.setLocalDetectedWord === "function") {
-    window.setLocalDetectedWord(latestDetectedWord);
-  }
-
-  if (broadcast && typeof window.broadcastDetectedWord === "function") {
-    window.broadcastDetectedWord(latestDetectedWord);
-  }
-}
-
-function showStatus(message) {
-  if (statusElement) {
-    statusElement.textContent = message;
-  }
-}
-
-function drawRoundedRect(ctx, x, y, width, height, radius) {
-  ctx.beginPath();
-  ctx.moveTo(x + radius, y);
-  ctx.lineTo(x + width - radius, y);
-  ctx.quadraticCurveTo(x + width, y, x + width, y + radius);
-  ctx.lineTo(x + width, y + height - radius);
-  ctx.quadraticCurveTo(x + width, y + height, x + width - radius, y + height);
-  ctx.lineTo(x + radius, y + height);
-  ctx.quadraticCurveTo(x, y + height, x, y + height - radius);
-  ctx.lineTo(x, y + radius);
-  ctx.quadraticCurveTo(x, y, x + radius, y);
-  ctx.closePath();
-}
-
-function prepareProcessingFrame() {
-  if (!videoElement || videoElement.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) {
-    return false;
-  }
-
-  processCtx.save();
-  processCtx.clearRect(0, 0, CAMERA_WIDTH, CAMERA_HEIGHT);
-  processCtx.translate(CAMERA_WIDTH, 0);
-  processCtx.scale(-1, 1);
-  processCtx.drawImage(videoElement, 0, 0, CAMERA_WIDTH, CAMERA_HEIGHT);
-  processCtx.restore();
-  return true;
-}
-
-function flattenLandmarks(landmarks, landmarkCount) {
-  const output = [];
-
-  if (!landmarks) {
-    return new Array(landmarkCount * 3).fill(0);
-  }
-
-  for (let i = 0; i < landmarkCount; i++) {
-    const point = landmarks[i];
-
-    if (!point) {
-      output.push(0, 0, 0);
-    } else {
-      output.push(point.x || 0, point.y || 0, point.z || 0);
-    }
-  }
-
-  return output;
-}
-
-function getHandLabel(handedness) {
-  if (!handedness) {
-    return "";
-  }
-
-  if (handedness.label) {
-    return handedness.label;
-  }
-
-  if (handedness.classification && handedness.classification[0] && handedness.classification[0].label) {
-    return handedness.classification[0].label;
-  }
-
-  return "";
-}
-
-function extractKeypoints(poseResults, handsResults) {
-  const poseKp = flattenLandmarks(poseResults.poseLandmarks, 33);
-  let leftHandKp = new Array(21 * 3).fill(0);
-  let rightHandKp = new Array(21 * 3).fill(0);
-
-  if (handsResults.multiHandLandmarks && handsResults.multiHandLandmarks.length > 0) {
-    for (let i = 0; i < handsResults.multiHandLandmarks.length; i++) {
-      const handLandmarks = handsResults.multiHandLandmarks[i];
-      const handedness = handsResults.multiHandedness ? handsResults.multiHandedness[i] : null;
-      const label = getHandLabel(handedness);
-      const kp = flattenLandmarks(handLandmarks, 21);
-
-      if (label === "Left") {
-        leftHandKp = kp;
-      } else {
-        rightHandKp = kp;
-      }
-    }
-  }
-
-  return [...poseKp, ...leftHandKp, ...rightHandKp];
-}
+// =========================
+// MEDIAPIPE POSE + HANDS
+// =========================
 
 let poseResolve = null;
 let handsResolve = null;
 
 const pose = new Pose({
-  locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/pose/${file}`
+  locateFile: function(file) {
+    return `https://cdn.jsdelivr.net/npm/@mediapipe/pose/${file}`;
+  }
 });
 
 pose.setOptions({
@@ -305,8 +131,11 @@ pose.onResults((results) => {
   }
 });
 
+
 const hands = new Hands({
-  locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`
+  locateFile: function(file) {
+    return `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`;
+  }
 });
 
 hands.setOptions({
@@ -324,99 +153,264 @@ hands.onResults((results) => {
   }
 });
 
+
 function processPose(image) {
   return new Promise((resolve) => {
     poseResolve = resolve;
-    pose.send({ image });
+    pose.send({ image: image });
   });
 }
+
 
 function processHands(image) {
   return new Promise((resolve) => {
     handsResolve = resolve;
-    hands.send({ image });
+    hands.send({ image: image });
   });
 }
 
+
+// =========================
+// FRAME PREPROCESSING
+// =========================
+
+function prepareProcessingFrame() {
+  processCtx.save();
+  processCtx.clearRect(0, 0, CAMERA_WIDTH, CAMERA_HEIGHT);
+
+  // Same idea as Python cv2.flip(frame, 1)
+  processCtx.translate(CAMERA_WIDTH, 0);
+  processCtx.scale(-1, 1);
+
+  processCtx.drawImage(
+    videoElement,
+    0,
+    0,
+    CAMERA_WIDTH,
+    CAMERA_HEIGHT
+  );
+
+  processCtx.restore();
+}
+
+
+function flattenLandmarks(landmarks, landmarkCount) {
+  const output = [];
+
+  if (!landmarks) {
+    return new Array(landmarkCount * 3).fill(0);
+  }
+
+  for (let i = 0; i < landmarkCount; i++) {
+    const point = landmarks[i];
+
+    if (!point) {
+      output.push(0, 0, 0);
+    } else {
+      output.push(
+        point.x || 0,
+        point.y || 0,
+        point.z || 0
+      );
+    }
+  }
+
+  return output;
+}
+
+
+function getHandLabel(handedness) {
+  if (!handedness) {
+    return "";
+  }
+
+  if (handedness.label) {
+    return handedness.label;
+  }
+
+  if (
+    handedness.classification &&
+    handedness.classification[0] &&
+    handedness.classification[0].label
+  ) {
+    return handedness.classification[0].label;
+  }
+
+  return "";
+}
+
+
+function extractKeypoints(poseResults, handsResults) {
+  const poseKp = flattenLandmarks(poseResults.poseLandmarks, 33);
+
+  let leftHandKp = new Array(21 * 3).fill(0);
+  let rightHandKp = new Array(21 * 3).fill(0);
+
+  if (handsResults.multiHandLandmarks && handsResults.multiHandLandmarks.length > 0) {
+    for (let i = 0; i < handsResults.multiHandLandmarks.length; i++) {
+      const handLandmarks = handsResults.multiHandLandmarks[i];
+
+      const handedness = handsResults.multiHandedness
+        ? handsResults.multiHandedness[i]
+        : null;
+
+      const label = getHandLabel(handedness);
+      const kp = flattenLandmarks(handLandmarks, 21);
+
+      // Same logic as your working Python:
+      // label Left -> left hand slot
+      // otherwise -> right hand slot
+      if (label === "Left") {
+        leftHandKp = kp;
+      } else {
+        rightHandKp = kp;
+      }
+    }
+  }
+
+  return [
+    ...poseKp,
+    ...leftHandKp,
+    ...rightHandKp
+  ];
+}
+
+
+// =========================
+// ARTISTIC CAMERA HUD
+// =========================
+
+function drawRoundedRect(ctx, x, y, width, height, radius) {
+  ctx.beginPath();
+  ctx.moveTo(x + radius, y);
+  ctx.lineTo(x + width - radius, y);
+  ctx.quadraticCurveTo(x + width, y, x + width, y + radius);
+  ctx.lineTo(x + width, y + height - radius);
+  ctx.quadraticCurveTo(x + width, y + height, x + width - radius, y + height);
+  ctx.lineTo(x + radius, y + height);
+  ctx.quadraticCurveTo(x, y + height, x, y + height - radius);
+  ctx.lineTo(x, y + radius);
+  ctx.quadraticCurveTo(x, y, x + radius, y);
+  ctx.closePath();
+}
+
+
 function drawHudBackground() {
-  const barHeight = 98;
+  const barHeight = 105;
+
   const gradient = canvasCtx.createLinearGradient(0, 0, CAMERA_WIDTH, 0);
-  gradient.addColorStop(0, "rgba(2, 6, 23, 0.94)");
+  gradient.addColorStop(0, "rgba(2, 6, 23, 0.92)");
   gradient.addColorStop(0.5, "rgba(6, 78, 59, 0.88)");
-  gradient.addColorStop(1, "rgba(2, 6, 23, 0.94)");
+  gradient.addColorStop(1, "rgba(2, 6, 23, 0.92)");
 
   canvasCtx.save();
+
   canvasCtx.fillStyle = gradient;
   canvasCtx.fillRect(0, 0, CAMERA_WIDTH, barHeight);
+
   canvasCtx.strokeStyle = "rgba(16, 185, 129, 0.9)";
   canvasCtx.lineWidth = 2;
   canvasCtx.beginPath();
   canvasCtx.moveTo(0, barHeight);
   canvasCtx.lineTo(CAMERA_WIDTH, barHeight);
   canvasCtx.stroke();
+
+  canvasCtx.fillStyle = "rgba(255, 255, 255, 0.08)";
+  drawRoundedRect(canvasCtx, 12, 13, CAMERA_WIDTH - 24, 78, 14);
+  canvasCtx.fill();
+
   canvasCtx.restore();
 }
+
 
 function drawTopBar() {
   drawHudBackground();
 
   const top1Percent = Math.round(lastPredictionInfo.top1Confidence * 100);
   const top2Percent = Math.round(lastPredictionInfo.top2Confidence * 100);
+  const top3Percent = Math.round(lastPredictionInfo.top3Confidence * 100);
   const marginPercent = Math.round(lastPredictionInfo.margin * 100);
 
+  const mainText = lastPredictionInfo.accepted
+    ? `1st: ${lastPredictionInfo.top1} (${top1Percent}%)`
+    : `Not sure (${top1Percent}%)`;
+
   canvasCtx.save();
+
   canvasCtx.font = "bold 20px Arial";
-  canvasCtx.fillStyle = lastPredictionInfo.accepted ? "#34d399" : "#fbbf24";
-  canvasCtx.fillText(
-    lastPredictionInfo.accepted
-      ? `1st: ${lastPredictionInfo.top1} (${top1Percent}%)`
-      : `Not sure (${top1Percent}%)`,
-    22,
-    36
-  );
+  canvasCtx.fillStyle = lastPredictionInfo.accepted ? "#34d399" : "#facc15";
+  canvasCtx.fillText(mainText, 25, 38);
 
   canvasCtx.font = "15px Arial";
   canvasCtx.fillStyle = "#a7f3d0";
-  canvasCtx.fillText(`2nd: ${lastPredictionInfo.top2} (${top2Percent}%)`, 22, 64);
+  canvasCtx.fillText(
+    `2nd: ${lastPredictionInfo.top2} (${top2Percent}%)`,
+    25,
+    66
+  );
+
+  canvasCtx.fillStyle = "#67e8f9";
+  canvasCtx.fillText(
+    `3rd: ${lastPredictionInfo.top3} (${top3Percent}%)`,
+    255,
+    66
+  );
 
   canvasCtx.fillStyle = "#ffffff";
-  canvasCtx.fillText(`Difference: ${marginPercent}%`, 240, 64);
+  canvasCtx.fillText(
+    `Difference: ${marginPercent}%`,
+    470,
+    66
+  );
 
   const meterWidth = 220;
-  const filledWidth = Math.max(0, Math.min(meterWidth, lastPredictionInfo.top1Confidence * meterWidth));
-  drawRoundedRect(canvasCtx, 22, 76, meterWidth, 8, 6);
+  const filledWidth = Math.max(
+    0,
+    Math.min(meterWidth, lastPredictionInfo.top1Confidence * meterWidth)
+  );
+
+  drawRoundedRect(canvasCtx, 25, 82, meterWidth, 8, 6);
   canvasCtx.fillStyle = "rgba(255, 255, 255, 0.18)";
   canvasCtx.fill();
-  drawRoundedRect(canvasCtx, 22, 76, filledWidth, 8, 6);
+
+  drawRoundedRect(canvasCtx, 25, 82, filledWidth, 8, 6);
   canvasCtx.fillStyle = "#34d399";
   canvasCtx.fill();
 
   canvasCtx.font = "bold 12px Arial";
   canvasCtx.fillStyle = "#d1fae5";
-  canvasCtx.fillText("POSE + HANDS + LSTM", CAMERA_WIDTH - 162, 24);
+  canvasCtx.fillText("HANDS ONLY + LSTM", CAMERA_WIDTH - 145, 28);
+
   canvasCtx.restore();
 }
 
+
 function drawCornerFrame(x, y, width, height) {
-  const length = 24;
+  const length = 26;
+
   canvasCtx.save();
   canvasCtx.strokeStyle = "#34d399";
   canvasCtx.lineWidth = 3;
   canvasCtx.lineCap = "round";
+
   canvasCtx.beginPath();
 
+  // top left
   canvasCtx.moveTo(x, y + length);
   canvasCtx.lineTo(x, y);
   canvasCtx.lineTo(x + length, y);
 
+  // top right
   canvasCtx.moveTo(x + width - length, y);
   canvasCtx.lineTo(x + width, y);
   canvasCtx.lineTo(x + width, y + length);
 
+  // bottom right
   canvasCtx.moveTo(x + width, y + height - length);
   canvasCtx.lineTo(x + width, y + height);
   canvasCtx.lineTo(x + width - length, y + height);
 
+  // bottom left
   canvasCtx.moveTo(x + length, y + height);
   canvasCtx.lineTo(x, y + height);
   canvasCtx.lineTo(x, y + height - length);
@@ -424,6 +418,7 @@ function drawCornerFrame(x, y, width, height) {
   canvasCtx.stroke();
   canvasCtx.restore();
 }
+
 
 function drawHandBox(handLandmarks) {
   const xs = handLandmarks.map((lm) => lm.x * CAMERA_WIDTH);
@@ -433,6 +428,7 @@ function drawHandBox(handLandmarks) {
   const xMax = Math.max(...xs);
   const yMin = Math.min(...ys);
   const yMax = Math.max(...ys);
+
   const boxWidth = xMax - xMin;
   const boxHeight = yMax - yMin;
 
@@ -451,22 +447,37 @@ function drawHandBox(handLandmarks) {
   const y2 = Math.min(CAMERA_HEIGHT, cy + half);
 
   canvasCtx.save();
+
   canvasCtx.shadowColor = "rgba(52, 211, 153, 0.9)";
   canvasCtx.shadowBlur = 18;
+
   canvasCtx.strokeStyle = "rgba(52, 211, 153, 0.38)";
   canvasCtx.lineWidth = 1;
   drawRoundedRect(canvasCtx, x1, y1, x2 - x1, y2 - y1, 16);
   canvasCtx.stroke();
+
   drawCornerFrame(x1, y1, x2 - x1, y2 - y1);
+
   canvasCtx.restore();
 }
 
-function drawDisplayFrame(handsResults) {
+
+function drawDisplayFrame(poseResults, handsResults) {
   canvasElement.width = CAMERA_WIDTH;
   canvasElement.height = CAMERA_HEIGHT;
-  canvasCtx.clearRect(0, 0, CAMERA_WIDTH, CAMERA_HEIGHT);
-  canvasCtx.drawImage(processCanvas, 0, 0, CAMERA_WIDTH, CAMERA_HEIGHT);
 
+  canvasCtx.clearRect(0, 0, CAMERA_WIDTH, CAMERA_HEIGHT);
+
+  // Draw the already-flipped processing frame.
+  canvasCtx.drawImage(
+    processCanvas,
+    0,
+    0,
+    CAMERA_WIDTH,
+    CAMERA_HEIGHT
+  );
+
+  // Dark cinematic vignette
   const vignette = canvasCtx.createRadialGradient(
     CAMERA_WIDTH / 2,
     CAMERA_HEIGHT / 2,
@@ -475,11 +486,16 @@ function drawDisplayFrame(handsResults) {
     CAMERA_HEIGHT / 2,
     CAMERA_WIDTH / 1.05
   );
+
   vignette.addColorStop(0, "rgba(0, 0, 0, 0)");
   vignette.addColorStop(1, "rgba(0, 0, 0, 0.34)");
+
   canvasCtx.fillStyle = vignette;
   canvasCtx.fillRect(0, 0, CAMERA_WIDTH, CAMERA_HEIGHT);
 
+  drawTopBar();
+
+  // Draw only hand landmarks + hand boxes
   if (handsResults.multiHandLandmarks && handsResults.multiHandLandmarks.length > 0) {
     handsResults.multiHandLandmarks.forEach((handLandmarks) => {
       drawConnectors(canvasCtx, handLandmarks, HAND_CONNECTIONS, {
@@ -499,6 +515,11 @@ function drawDisplayFrame(handsResults) {
   }
 }
 
+
+// =========================
+// PREDICTION SMOOTHING
+// =========================
+
 function smoothPrediction(data) {
   predictionQueue.push({
     word: data.word,
@@ -515,6 +536,7 @@ function smoothPrediction(data) {
   }
 
   const counts = {};
+
   predictionQueue.forEach((item) => {
     counts[item.word] = (counts[item.word] || 0) + 1;
   });
@@ -531,8 +553,12 @@ function smoothPrediction(data) {
 
   const matching = predictionQueue.filter((item) => item.word === bestWord);
   const latest = matching[matching.length - 1];
-  const avgConfidence = matching.reduce((sum, item) => sum + item.confidence, 0) / matching.length;
-  const avgMargin = matching.reduce((sum, item) => sum + item.margin, 0) / matching.length;
+
+  const avgConfidence =
+    matching.reduce((sum, item) => sum + item.confidence, 0) / matching.length;
+
+  const avgMargin =
+    matching.reduce((sum, item) => sum + item.margin, 0) / matching.length;
 
   return {
     word: bestWord,
@@ -545,12 +571,14 @@ function smoothPrediction(data) {
   };
 }
 
+
 function isPredictionSure(prediction) {
-  return (
-    prediction.confidence >= CONFIDENCE_THRESHOLD &&
-    prediction.margin >= MINIMUM_PREDICTION_MARGIN
-  );
+  const confidentEnough = prediction.confidence >= CONFIDENCE_THRESHOLD;
+  const marginEnough = prediction.margin >= MINIMUM_PREDICTION_MARGIN;
+
+  return confidentEnough && marginEnough;
 }
+
 
 function confirmStablePrediction(word) {
   if (pendingPrediction.word === word) {
@@ -563,10 +591,12 @@ function confirmStablePrediction(word) {
   return pendingPrediction.count >= REQUIRED_STABLE_PREDICTIONS;
 }
 
+
 function resetPredictionStability() {
   pendingPrediction.word = "";
   pendingPrediction.count = 0;
 }
+
 
 function addWordToSentence(word) {
   const now = Date.now();
@@ -577,10 +607,14 @@ function addWordToSentence(word) {
 
   lastAddedWord = word;
   lastAddedTime = now;
-  updateDetectedWord(word, true);
-  transcriptWords.push(word);
-  renderTranscript();
+
+  if (sentenceInput.value.trim().length === 0) {
+    sentenceInput.value = word;
+  } else {
+    sentenceInput.value += " " + word;
+  }
 }
+
 
 async function sendPrediction() {
   if (isPredicting) {
@@ -588,6 +622,7 @@ async function sendPrediction() {
   }
 
   const now = Date.now();
+
   if (now - lastPredictionTime < PREDICTION_INTERVAL_MS) {
     return;
   }
@@ -596,13 +631,13 @@ async function sendPrediction() {
   isPredicting = true;
 
   try {
-    const response = await fetch(`${BACKEND_ORIGIN}/predict`, {
+    const response = await fetch("/predict", {
       method: "POST",
       headers: {
         "Content-Type": "application/json"
       },
       body: JSON.stringify({
-        sequence
+        sequence: sequence
       })
     });
 
@@ -610,13 +645,16 @@ async function sendPrediction() {
 
     if (!response.ok) {
       console.error("Prediction error:", data);
-      showStatus(`Backend error: ${data.error}. Received ${data.received}, expected ${data.expected}.`);
+
+      statusElement.textContent =
+        `Backend error: ${data.error}. Received ${data.received}, expected ${data.expected}.`;
+
+      isPredicting = false;
       return;
     }
 
     const smoothed = smoothPrediction(data);
     const sure = isPredictionSure(smoothed);
-    updateDetectedWord(smoothed.word);
 
     lastPredictionInfo = {
       top1: smoothed.word,
@@ -635,58 +673,69 @@ async function sendPrediction() {
     if (sure) {
       const stable = confirmStablePrediction(smoothed.word);
 
-      showStatus(
-        `Checking: ${smoothed.word} (${pendingPrediction.count}/${REQUIRED_STABLE_PREDICTIONS}) | Confidence: ${confidencePercent}% | Difference: ${marginPercent}%`
-      );
+      statusElement.textContent =
+        `Checking: ${smoothed.word} (${pendingPrediction.count}/${REQUIRED_STABLE_PREDICTIONS}) | Confidence: ${confidencePercent}% | Difference: ${marginPercent}%`;
 
       if (stable) {
         addWordToSentence(smoothed.word);
         resetPredictionStability();
-        showStatus(`Recognized: ${smoothed.word} | Confidence: ${confidencePercent}%`);
+
+        statusElement.textContent =
+          `Recognized: ${smoothed.word} | Confidence: ${confidencePercent}%`;
       }
     } else {
       resetPredictionStability();
-      showStatus(
-        `Not sure: ${smoothed.word} vs ${smoothed.top2Word} | Confidence: ${confidencePercent}% | Difference: ${marginPercent}%`
-      );
+
+      statusElement.textContent =
+        `Not sure: ${smoothed.word} vs ${smoothed.top2Word} | Confidence: ${confidencePercent}% | Difference: ${marginPercent}%`;
     }
+
   } catch (error) {
     console.error("Server error:", error);
-    showStatus("Could not connect to Flask server.");
-  } finally {
-    isPredicting = false;
+    statusElement.textContent = "Could not connect to Flask server.";
   }
+
+  isPredicting = false;
 }
 
+
+// =========================
+// MAIN FRAME LOOP
+// =========================
+
 async function processCurrentFrame() {
-  if (!prepareProcessingFrame()) {
-    return;
-  }
+  prepareProcessingFrame();
 
   const poseResults = await processPose(processCanvas);
   const handsResults = await processHands(processCanvas);
-  drawDisplayFrame(handsResults);
 
-  const hasHand = handsResults.multiHandLandmarks && handsResults.multiHandLandmarks.length > 0;
+  drawDisplayFrame(poseResults, handsResults);
+
+  const hasHand =
+    handsResults.multiHandLandmarks &&
+    handsResults.multiHandLandmarks.length > 0;
 
   if (!hasHand) {
     sequence = [];
     predictionQueue = [];
     resetPredictionStability();
+
     lastPredictionInfo.accepted = false;
     lastPredictionInfo.top1Confidence = 0;
     lastPredictionInfo.top2Confidence = 0;
     lastPredictionInfo.top3Confidence = 0;
     lastPredictionInfo.margin = 0;
-    updateDetectedWord("");
-    showStatus("Show your hand clearly inside the camera frame.");
+
+    statusElement.textContent = "Show your hand clearly inside the camera frame.";
     return;
   }
 
   const keypoints = extractKeypoints(poseResults, handsResults);
 
   if (keypoints.length !== NUM_FEATURES) {
-    showStatus(`Wrong feature length. Got ${keypoints.length}, expected ${NUM_FEATURES}.`);
+    statusElement.textContent =
+      `Wrong feature length. Got ${keypoints.length}, expected ${NUM_FEATURES}.`;
+
     return;
   }
 
@@ -697,101 +746,56 @@ async function processCurrentFrame() {
   }
 
   if (sequence.length < SEQUENCE_LENGTH) {
-    showStatus(`Collecting frames: ${sequence.length}/${SEQUENCE_LENGTH}`);
+    statusElement.textContent =
+      `Collecting frames: ${sequence.length}/${SEQUENCE_LENGTH}`;
+
     return;
   }
 
   sendPrediction();
 }
 
-function recognitionLoop() {
-  if (!cameraStarted) {
-    recognitionLoopRunning = false;
-    frameBusy = false;
-    return;
-  }
 
-  if (!frameBusy) {
-    frameBusy = true;
-    processCurrentFrame()
-      .catch((error) => {
-        console.error("Frame processing error:", error);
-      })
-      .finally(() => {
-        frameBusy = false;
-      });
-  }
-
-  requestAnimationFrame(recognitionLoop);
-}
+// =========================
+// CAMERA CONTROL
+// =========================
 
 async function startCamera() {
   if (cameraStarted) {
-    return localStream;
-  }
-
-  if (cameraStartPromise) {
-    return cameraStartPromise;
-  }
-
-  cameraStartPromise = (async () => {
-    const stream = await navigator.mediaDevices.getUserMedia({
-      video: {
-        width: { ideal: CAMERA_WIDTH },
-        height: { ideal: CAMERA_HEIGHT },
-        facingMode: "user"
-      },
-      audio: true
-    });
-
-    localStream = stream;
-    videoElement.srcObject = stream;
-    await videoElement.play().catch(() => {});
-
-    cameraStarted = true;
-    cameraBtn.textContent = "Turn camera off";
-    if (typeof window.setLocalStatus === "function") {
-      window.setLocalStatus("Camera on");
-    }
-    showStatus("Camera started. Join a room to meet with others.");
-
-    if (!recognitionLoopRunning) {
-      recognitionLoopRunning = true;
-      requestAnimationFrame(recognitionLoop);
-    }
-
-    return stream;
-  })();
-
-  try {
-    return await cameraStartPromise;
-  } finally {
-    cameraStartPromise = null;
-  }
-}
-
-function stopCamera() {
-  if (!cameraStarted) {
     return;
   }
 
-  cameraStarted = false;
-  cameraBtn.textContent = "Turn camera on";
-  showStatus("Camera stopped.");
+  camera = new Camera(videoElement, {
+    onFrame: async function() {
+      await processCurrentFrame();
+    },
+    width: CAMERA_WIDTH,
+    height: CAMERA_HEIGHT
+  });
 
-  if (localStream) {
-    localStream.getTracks().forEach((track) => track.stop());
-    localStream = null;
+  await camera.start();
+
+  cameraStarted = true;
+  cameraBtn.textContent = "Camera Off";
+  statusElement.textContent = "Camera started.";
+}
+
+
+function stopCamera() {
+  if (!cameraStarted || !camera) {
+    return;
   }
 
-  videoElement.srcObject = null;
+  camera.stop();
+
+  cameraStarted = false;
+  cameraBtn.textContent = "Camera On";
+  statusElement.textContent = "Camera stopped.";
+
   sequence = [];
   predictionQueue = [];
   resetPredictionStability();
-  updateDetectedWord("");
-  if (typeof window.setLocalStatus === "function") {
-    window.setLocalStatus("Camera off");
-  }
+
   lastPredictionInfo = {
     top1: "--",
     top1Confidence: 0,
@@ -806,6 +810,7 @@ function stopCamera() {
   canvasCtx.clearRect(0, 0, canvasElement.width, canvasElement.height);
 }
 
+
 cameraBtn.addEventListener("click", async () => {
   try {
     if (cameraStarted) {
@@ -815,17 +820,93 @@ cameraBtn.addEventListener("click", async () => {
     }
   } catch (error) {
     console.error("Camera error:", error);
-    showStatus("Camera failed. Allow camera permission and use localhost.");
+
+    statusElement.textContent =
+      "Camera failed. Allow camera permission and use localhost.";
   }
 });
 
-window.startCamera = startCamera;
-window.stopCamera = stopCamera;
-window.getLocalStream = () => localStream;
-window.updateConnectionPill = updateConnectionPill;
 
-window.addEventListener("beforeunload", () => {
-  if (localStream) {
-    localStream.getTracks().forEach((track) => track.stop());
-  }
+// =========================
+// BUTTONS
+// =========================
+
+backspaceBtn.addEventListener("click", () => {
+  sentenceInput.value = sentenceInput.value.trim().slice(0, -1);
 });
+
+
+spaceBtn.addEventListener("click", () => {
+  sentenceInput.value += " ";
+});
+
+
+clearSentenceBtn.addEventListener("click", () => {
+  sentenceInput.value = "";
+  predictionQueue = [];
+  resetPredictionStability();
+});
+
+
+clearChatBtn.addEventListener("click", () => {
+  chatBox.innerHTML = "";
+});
+
+
+sendBtn.addEventListener("click", () => {
+  const text = sentenceInput.value.trim();
+
+  if (!text) {
+    return;
+  }
+
+  const message = document.createElement("div");
+  message.className = "chat-message";
+  message.textContent = text;
+
+  chatBox.appendChild(message);
+  chatBox.scrollTop = chatBox.scrollHeight;
+
+  sentenceInput.value = "";
+  predictionQueue = [];
+  resetPredictionStability();
+});
+
+// =========================
+// IMAGE POPUP FOR METRICS
+// =========================
+
+const imagePopup = document.getElementById("imagePopup");
+const popupImage = document.getElementById("popupImage");
+const closePopup = document.getElementById("closePopup");
+
+if (imagePopup && popupImage && closePopup) {
+  document.querySelectorAll(".metric-image-box img").forEach((image) => {
+    image.addEventListener("click", () => {
+      popupImage.src = image.src;
+      popupImage.alt = image.alt;
+      imagePopup.classList.add("active");
+      imagePopup.setAttribute("aria-hidden", "false");
+    });
+  });
+
+  function closeImagePopup() {
+    imagePopup.classList.remove("active");
+    imagePopup.setAttribute("aria-hidden", "true");
+    popupImage.src = "";
+  }
+
+  closePopup.addEventListener("click", closeImagePopup);
+
+  imagePopup.addEventListener("click", (event) => {
+    if (event.target === imagePopup) {
+      closeImagePopup();
+    }
+  });
+
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") {
+      closeImagePopup();
+    }
+  });
+}

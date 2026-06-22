@@ -1,54 +1,24 @@
-# Use eventlet for async Socket.IO support in hosted environments (Railway, Heroku, etc.)
-import eventlet
-eventlet.monkey_patch()
-
 from pathlib import Path
-from collections import defaultdict
 import pickle
 
 import numpy as np
 from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
-from flask_socketio import SocketIO, emit, join_room, leave_room, rooms as socket_rooms
 import tensorflow as tf
 from tensorflow.keras.models import load_model, Sequential
 from tensorflow.keras.layers import LSTM, Dense, Dropout, BatchNormalization
-import os
+
 
 BASE_DIR = Path(__file__).resolve().parent
 
 MODEL_PATH = BASE_DIR / "best_model.h5"
 CLASSES_PATH = BASE_DIR / "classes.pkl"
 
-# Allow supplying a remote model URL (e.g., S3) when deploying to platforms with repo size limits.
-MODEL_URL = os.environ.get("MODEL_URL")
-CLASSES_URL = os.environ.get("CLASSES_URL")
-if not MODEL_PATH.exists() and MODEL_URL:
-    try:
-        print(f"[INFO] Downloading model from {MODEL_URL} to {MODEL_PATH} ...")
-        import urllib.request
-        urllib.request.urlretrieve(MODEL_URL, str(MODEL_PATH))
-        print("[OK] Model downloaded.")
-    except Exception as e:
-        print("[WARN] Failed to download model:", e)
-
-if not CLASSES_PATH.exists() and CLASSES_URL:
-    try:
-        print(f"[INFO] Downloading classes from {CLASSES_URL} to {CLASSES_PATH} ...")
-        import urllib.request
-        urllib.request.urlretrieve(CLASSES_URL, str(CLASSES_PATH))
-        print("[OK] Classes downloaded.")
-    except Exception as e:
-        print("[WARN] Failed to download classes:", e)
-
 FRAMES = 15
 NUM_FEATURES = 225
 
 app = Flask(__name__, static_folder=".", static_url_path="")
 CORS(app)
-# Prefer eventlet if available so WebSocket transport works in production.
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode="eventlet")
-room_members = defaultdict(set)
 
 
 def load_classes():
@@ -106,21 +76,12 @@ def load_sign_model():
         return loaded_model
 
 
-model = None
-SEQUENCE_LENGTH = FRAMES
-MODEL_FEATURES = NUM_FEATURES
+with tf.device("/CPU:0"):
+    model = load_sign_model()
 
-# Load model but don't crash the process if loading fails at startup. Expose health endpoint.
-try:
-    with tf.device("/CPU:0"):
-        model = load_sign_model()
-    # If loaded, override sequence/features to actual model shape
-    if model is not None and getattr(model, 'input_shape', None):
-        SEQUENCE_LENGTH = model.input_shape[1]
-        MODEL_FEATURES = model.input_shape[2]
-except Exception as e:
-    print("[ERROR] Model failed to load at startup:", e)
-    model = None
+
+SEQUENCE_LENGTH = model.input_shape[1]
+MODEL_FEATURES = model.input_shape[2]
 
 
 @app.route("/")
@@ -136,88 +97,6 @@ def styles():
 @app.route("/app.js")
 def app_js():
     return send_from_directory(".", "app.js")
-
-
-@app.route("/health")
-def health():
-    model_loaded = model is not None
-    input_shape = list(model.input_shape) if model_loaded and getattr(model, 'input_shape', None) else None
-    output_shape = list(model.output_shape) if model_loaded and getattr(model, 'output_shape', None) else None
-
-    return jsonify({
-        "ok": True,
-        "model_loaded": model_loaded,
-        "input_shape": input_shape,
-        "output_shape": output_shape,
-        "classes": len(ACTIONS)
-    })
-
-
-@socketio.on('join')
-def handle_join(data):
-    room = data.get('room')
-    if room:
-        join_room(room)
-        room_members[room].add(request.sid)
-
-        existing_peers = [
-            sid for sid in room_members[room]
-            if sid != request.sid
-        ]
-
-        emit('room-peers', {
-            'room': room,
-            'sid': request.sid,
-            'peers': existing_peers
-        })
-
-        emit('peer-joined', {
-            'sid': request.sid,
-            'room': room
-        }, room=room, include_self=False)
-
-
-@socketio.on('signal')
-def handle_signal(data):
-    # data: { 'target': target_sid, 'signal': <offer/answer/ice> }
-    target = data.get('target')
-    signal = data.get('signal')
-    if target and signal is not None:
-        emit('signal', {'source': request.sid, 'signal': signal}, to=target)
-
-
-@socketio.on('leave')
-def handle_leave(data):
-    room = data.get('room')
-    if room:
-        leave_room(room)
-        room_members[room].discard(request.sid)
-        if not room_members[room]:
-            room_members.pop(room, None)
-        emit('peer-left', {'sid': request.sid}, room=room)
-
-
-@socketio.on('word-update')
-def handle_word_update(data):
-    room = data.get('room')
-    word = data.get('word', '')
-    if room:
-        emit('word-update', {
-            'sid': request.sid,
-            'word': word,
-            'room': room
-        }, room=room, include_self=True)
-
-
-@socketio.on('disconnect')
-def handle_disconnect():
-    joined_rooms = [room for room in socket_rooms() if room != request.sid]
-
-    for room in joined_rooms:
-        room_members[room].discard(request.sid)
-        if not room_members[room]:
-            room_members.pop(room, None)
-        emit('peer-left', {'sid': request.sid}, room=room)
 
 
 @app.route("/predict", methods=["POST"])
@@ -237,9 +116,6 @@ def predict():
             "received": list(sequence.shape),
             "expected": list(expected_shape)
         }), 400
-
-    if model is None:
-        return jsonify({"error": "Model not loaded"}), 503
 
     input_data = np.expand_dims(sequence, axis=0)
 
@@ -283,5 +159,5 @@ if __name__ == "__main__":
     print("Input shape:", model.input_shape)
     print("Output shape:", model.output_shape)
     print("===================================")
-    port = int(os.environ.get("PORT", 5000))
-    socketio.run(app, host="0.0.0.0", port=port, debug=False, use_reloader=False)
+
+    app.run(host="127.0.0.1", port=5000, debug=True, use_reloader=False)

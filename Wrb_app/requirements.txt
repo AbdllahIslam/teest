@@ -1,8 +1,6 @@
 flask
 flask-cors
-flask-socketio
 numpy
 h5py
-eventlet
-tensorflow-cpu==2.21.0
+tensorflow
 gunicorn
