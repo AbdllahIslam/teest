@@ -1,117 +1,938 @@
-const sections = document.querySelectorAll(".page-section");
-const navButtons = document.querySelectorAll("[data-page]");
+// ==========================================================================
+// CONSTANTS & STATE
+// ==========================================================================
 
-const videoElement = document.getElementById("webcam");
-const canvasElement = document.getElementById("canvas");
-const canvasCtx = canvasElement.getContext("2d");
-
-const cameraBtn = document.getElementById("cameraBtn");
-const backspaceBtn = document.getElementById("backspaceBtn");
-const spaceBtn = document.getElementById("spaceBtn");
-const clearSentenceBtn = document.getElementById("clearSentenceBtn");
-const clearChatBtn = document.getElementById("clearChatBtn");
-const sendBtn = document.getElementById("sendBtn");
-
-const sentenceInput = document.getElementById("sentenceInput");
-const chatBox = document.getElementById("chatBox");
-const statusElement = document.getElementById("status");
-
-// Same shape as your Python model
 const SEQUENCE_LENGTH = 15;
 const NUM_FEATURES = 225;
-
-// Same camera style as your good Python test
 const CAMERA_WIDTH = 640;
 const CAMERA_HEIGHT = 480;
 
-// One fixed model setting only
+// Model confidence thresholds (match original values)
 const CONFIDENCE_THRESHOLD = 0.70;
 const MINIMUM_PREDICTION_MARGIN = 0.10;
 
-// Stability settings
+// Model stability parameters
 const REQUIRED_STABLE_PREDICTIONS = 3;
 const PREDICTION_QUEUE_SIZE = 5;
 const WORD_REPEAT_DELAY_MS = 1800;
 const PREDICTION_INTERVAL_MS = 450;
 
+// App navigation state
+let currentScreen = "lobby"; // "lobby" or "meeting"
+
+// Room connection details
+let roomId = "";
+let userId = "";
+let username = "";
+let lastEventId = 0;
+
+// Media streams
+let localStream = null;
+let lobbyStream = null;
+let cameraOn = true;
+let micOn = true;
+let recognitionActive = false;
+
+// MediaPipe state
+let poseResolve = null;
+let handsResolve = null;
+let frameLoopActive = false;
+
+// Model prediction state
 let sequence = [];
 let isPredicting = false;
-let cameraStarted = false;
-let camera = null;
-
 let lastPredictionTime = 0;
 let lastAddedWord = "";
 let lastAddedTime = 0;
-
-let pendingPrediction = {
-  word: "",
-  count: 0
-};
-
 let predictionQueue = [];
+let pendingPrediction = { word: "", count: 0 };
 
-let lastPredictionInfo = {
-  top1: "--",
-  top1Confidence: 0,
-  top2: "--",
-  top2Confidence: 0,
-  top3: "--",
-  top3Confidence: 0,
-  margin: 0,
-  accepted: false
-};
+// Peer connections (WebRTC Mesh)
+const peerConnections = {}; // targetUserId -> RTCPeerConnection
 
-// Hidden canvas for processing.
-// This mimics Python: frame = cv2.flip(frame, 1)
+// Speech bubble timers
+const bubbleTimers = {}; // userId -> setTimeout ID
+
+// Timers for polling and heartbeats
+let pollInterval = null;
+let heartbeatInterval = null;
+
+// ==========================================================================
+// DOM ELEMENTS
+// ==========================================================================
+
+const body = document.body;
+const lobbyScreen = document.getElementById("lobby-screen");
+const meetingScreen = document.getElementById("meeting-screen");
+
+// Lobby inputs & buttons
+const usernameInput = document.getElementById("usernameInput");
+const roomInput = document.getElementById("roomInput");
+const randomRoomBtn = document.getElementById("random-room-btn");
+const joinMeetingBtn = document.getElementById("join-meeting-btn");
+const lobbyWebcam = document.getElementById("lobbyWebcam");
+const lobbyCamToggle = document.getElementById("lobbyCamToggle");
+const lobbyMicToggle = document.getElementById("lobbyMicToggle");
+
+// Meeting layout elements
+const videoGrid = document.getElementById("video-grid");
+const webcamElement = document.getElementById("webcam");
+const canvasElement = document.getElementById("canvas");
+const canvasCtx = canvasElement ? canvasElement.getContext("2d") : null;
+const roomBadge = document.getElementById("room-badge");
+const displayRoomId = document.getElementById("display-room-id");
+const copyRoomBtn = document.getElementById("copy-room-btn");
+const roomHeaderStatus = document.getElementById("room-header-status");
+const themeToggleBtn = document.getElementById("theme-toggle-btn");
+
+// Sidebar elements
+const sidebar = document.getElementById("sidebar");
+const sidebarToggleBtn = document.getElementById("sidebar-toggle-btn");
+const tabChat = document.getElementById("tab-chat");
+const tabVocab = document.getElementById("tab-vocab");
+const panelChat = document.getElementById("panel-chat");
+const panelVocab = document.getElementById("panel-vocab");
+const chatBox = document.getElementById("chat-box");
+const chatInput = document.getElementById("chat-input");
+const sendChatBtn = document.getElementById("send-chat-btn");
+
+// Control bar elements
+const micToggleBtn = document.getElementById("mic-toggle-btn");
+const cameraToggleBtn = document.getElementById("camera-toggle-btn");
+const recognitionToggleBtn = document.getElementById("recognition-toggle-btn");
+const leaveBtn = document.getElementById("leave-btn");
+const recognitionStatusText = document.getElementById("recognition-status");
+
+// Hidden canvas for processing (mimics Python cv2.flip(frame, 1))
 const processCanvas = document.createElement("canvas");
 processCanvas.width = CAMERA_WIDTH;
 processCanvas.height = CAMERA_HEIGHT;
 const processCtx = processCanvas.getContext("2d");
 
+// ==========================================================================
+// INITIALIZATION & THEME SWITCHER
+// ==========================================================================
 
-// =========================
-// PAGE NAVIGATION
-// =========================
+document.addEventListener("DOMContentLoaded", () => {
+  // Restore theme preference
+  const savedTheme = localStorage.getItem("theme") || "dark";
+  body.setAttribute("data-theme", savedTheme);
+  updateThemeIcon(savedTheme);
 
-function showPage(pageId) {
-  sections.forEach((section) => {
-    section.classList.remove("active");
-  });
+  // Initialize inputs
+  generateRandomRoomId();
+  setupEventListeners();
 
-  const page = document.getElementById(pageId);
+  // Try to start preview camera
+  startLobbyPreview();
+});
 
-  if (page) {
-    page.classList.add("active");
+function updateThemeIcon(theme) {
+  if (themeToggleBtn) {
+    const icon = themeToggleBtn.querySelector(".theme-icon");
+    if (icon) {
+      icon.textContent = theme === "light" ? "🌙" : "☀️";
+    }
+  }
+}
+
+function toggleTheme() {
+  const currentTheme = body.getAttribute("data-theme");
+  const newTheme = currentTheme === "light" ? "dark" : "light";
+  body.setAttribute("data-theme", newTheme);
+  localStorage.setItem("theme", newTheme);
+  updateThemeIcon(newTheme);
+}
+
+// Generate random room code like abc-def-ghi
+function generateRandomRoomId() {
+  const chars = "abcdefghijklmnopqrstuvwxyz";
+  const segment = () => Array.from({ length: 3 }, () => chars[Math.floor(Math.random() * chars.length)]).join("");
+  const code = `${segment()}-${segment()}-${segment()}`;
+  if (roomInput) {
+    roomInput.value = code;
+  }
+}
+
+// ==========================================================================
+// CAMERA & MIC CONTROLS (LOBBY & GENERAL)
+// ==========================================================================
+
+async function populateCameraList() {
+  try {
+    let devices = await navigator.mediaDevices.enumerateDevices();
+    let videoDevices = devices.filter(d => d.kind === "videoinput");
+    const cameraSelect = document.getElementById("cameraSelect");
+    if (!cameraSelect) return;
+
+    // If no devices are returned, request permission to prompt the browser and re-enumerate
+    if (videoDevices.length === 0) {
+      try {
+        const tempStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+        // stop tracks immediately - just needed to grant permission
+        tempStream.getTracks().forEach(t => t.stop());
+        devices = await navigator.mediaDevices.enumerateDevices();
+        videoDevices = devices.filter(d => d.kind === "videoinput");
+      } catch (permErr) {
+        console.warn("Permission request for devices failed:", permErr);
+      }
+    }
+
+    const prev = cameraSelect.value;
+    cameraSelect.innerHTML = "";
+    videoDevices.forEach((device, i) => {
+      const opt = document.createElement("option");
+      opt.value = device.deviceId;
+      opt.textContent = device.label || `Camera ${i+1}`;
+      cameraSelect.appendChild(opt);
+    });
+    if (prev) {
+      const exists = Array.from(cameraSelect.options).some(o => o.value === prev);
+      cameraSelect.value = exists ? prev : (cameraSelect.options[0] ? cameraSelect.options[0].value : "");
+    } else {
+      if (cameraSelect.options[0]) cameraSelect.value = cameraSelect.options[0].value;
+    }
+    cameraSelect.onchange = () => {
+      stopLobbyPreview();
+      startLobbyPreview();
+    };
+  } catch (e) {
+    console.warn("Could not enumerate devices:", e);
+  }
+}
+
+async function startLobbyPreview() {
+  try {
+    await populateCameraList();
+    const cameraSelect = document.getElementById("cameraSelect");
+    const selectedId = cameraSelect && cameraSelect.value ? cameraSelect.value : null;
+    const preferredVideo = selectedId ? { deviceId: { exact: selectedId }, width: CAMERA_WIDTH, height: CAMERA_HEIGHT } : { width: CAMERA_WIDTH, height: CAMERA_HEIGHT };
+    let stream;
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({ video: preferredVideo, audio: true });
+    } catch (err) {
+      console.warn("getUserMedia with selected device failed, retrying default camera:", err);
+      stream = await navigator.mediaDevices.getUserMedia({ video: { width: CAMERA_WIDTH, height: CAMERA_HEIGHT }, audio: true });
+    }
+    lobbyStream = stream;
+    if (lobbyWebcam) {
+      lobbyWebcam.srcObject = lobbyStream;
+      lobbyWebcam.play().catch(e => console.log("Lobby video play error:", e));
+    }
+  } catch (err) {
+    console.error("Error accessing camera for lobby preview:", err);
+    alert("Please allow camera and microphone permissions to join the meeting.");
+  }
+}
+
+function stopLobbyPreview() {
+  if (lobbyStream) {
+    lobbyStream.getTracks().forEach(track => track.stop());
+    lobbyStream = null;
+  }
+  if (lobbyWebcam) {
+    lobbyWebcam.srcObject = null;
+  }
+}
+
+function toggleLobbyCam() {
+  if (!lobbyStream) return;
+  cameraOn = !cameraOn;
+  lobbyStream.getVideoTracks().forEach(track => track.enabled = cameraOn);
+  lobbyCamToggle.classList.toggle("muted", !cameraOn);
+  lobbyCamToggle.textContent = cameraOn ? "📹" : "❌";
+}
+
+function toggleLobbyMic() {
+  if (!lobbyStream) return;
+  micOn = !micOn;
+  lobbyStream.getAudioTracks().forEach(track => track.enabled = micOn);
+  lobbyMicToggle.classList.toggle("muted", !micOn);
+  lobbyMicToggle.textContent = micOn ? "🎙️" : "❌";
+}
+
+async function startMeetingStream() {
+  try {
+    const cameraSelect = document.getElementById("cameraSelect");
+    const selectedId = cameraSelect && cameraSelect.value ? cameraSelect.value : null;
+    const preferredVideo = selectedId ? { deviceId: { exact: selectedId }, width: CAMERA_WIDTH, height: CAMERA_HEIGHT } : { width: CAMERA_WIDTH, height: CAMERA_HEIGHT };
+    let stream;
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({ video: preferredVideo, audio: true });
+    } catch (err) {
+      console.warn("getUserMedia with selected device failed, retrying default camera:", err);
+      stream = await navigator.mediaDevices.getUserMedia({ video: { width: CAMERA_WIDTH, height: CAMERA_HEIGHT }, audio: true });
+    }
+    localStream = stream;
+
+    if (webcamElement) {
+      webcamElement.srcObject = localStream;
+      await webcamElement.play();
+    }
+
+    // Apply mic/cam preferences from lobby toggles
+    localStream.getVideoTracks().forEach(track => track.enabled = cameraOn);
+    localStream.getAudioTracks().forEach(track => track.enabled = micOn);
+
+    const localCard = document.getElementById("local-video-card");
+    if (localCard) {
+      localCard.classList.toggle("camera-off", !cameraOn);
+    }
+    const localMicIndicator = document.getElementById("local-mic-indicator");
+    if (localMicIndicator) {
+      localMicIndicator.classList.toggle("hidden", micOn);
+    }
+
+    // Add local tracks to any already initialized peer connections
+    Object.keys(peerConnections).forEach(targetUserId => {
+      const pc = peerConnections[targetUserId];
+      localStream.getTracks().forEach(track => {
+        pc.addTrack(track, localStream);
+      });
+    });
+
+  } catch (err) {
+    console.error("Error starting meeting stream:", err);
+    alert("Could not access camera or microphone for the meeting.");
+  }
+}
+
+// ==========================================================================
+// MEETING LIFE CYCLE: JOIN, HEARTBEAT, LEAVE
+// ==========================================================================
+
+async function joinMeeting() {
+  const name = usernameInput.value.trim();
+  const room = roomInput.value.trim();
+
+  if (!name) {
+    alert("Please enter your name");
+    return;
+  }
+  if (!room) {
+    alert("Please enter a room code");
+    return;
   }
 
-  document.querySelectorAll(".nav-btn").forEach((btn) => {
-    btn.classList.remove("active");
+  username = name;
+  roomId = room;
 
-    if (btn.dataset.page === pageId) {
-      btn.classList.add("active");
+  try {
+    const response = await fetch("/api/rooms/join", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ room_id: roomId, username: username })
+    });
+
+    if (!response.ok) {
+      const errData = await response.json();
+      alert(`Join error: ${errData.error}`);
+      return;
     }
+
+    const data = await response.json();
+    userId = data.user_id;
+
+    // Transition Screen
+    stopLobbyPreview();
+    lobbyScreen.classList.remove("active");
+    meetingScreen.classList.add("active");
+    currentScreen = "meeting";
+
+    // Set UI Header Info
+    roomHeaderStatus.textContent = "Connected";
+    displayRoomId.textContent = roomId;
+    roomBadge.classList.remove("hidden");
+
+    // Connect WebRTC to all existing participants in the room
+    data.participants.forEach(p => {
+      // Joiner initiates peer connection
+      initiatePeerConnection(p.id, p.name, true);
+    });
+
+    // Start local camera/mic stream
+    await startMeetingStream();
+
+    // Configure Button Classes
+    cameraToggleBtn.classList.toggle("muted", !cameraOn);
+    micToggleBtn.classList.toggle("muted", !micOn);
+
+    // Initial sync and start timers
+    lastEventId = 0;
+    startSyncIntervals();
+
+    // Start Landmark Frame Processing Loop
+    frameLoopActive = true;
+    requestAnimationFrame(frameLoop);
+
+    // Turn on Sign Language recognition by default
+    toggleSignRecognition(true);
+
+    addSystemMessage("You joined the meeting.");
+  } catch (err) {
+    console.error("Connection error:", err);
+    alert("Could not connect to the room server.");
+  }
+}
+
+async function leaveMeeting() {
+  // Stop frame loops
+  frameLoopActive = false;
+  toggleSignRecognition(false);
+  stopSyncIntervals();
+
+  // Notify server
+  if (roomId && userId) {
+    try {
+      await fetch(`/api/rooms/${roomId}/leave`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ user_id: userId })
+      });
+    } catch (err) {
+      console.error("Error sending leave event:", err);
+    }
+  }
+
+  // Close all WebRTC peers
+  Object.keys(peerConnections).forEach(pid => {
+    peerConnections[pid].close();
+    delete peerConnections[pid];
+  });
+
+  // Remove remote video elements
+  const cards = videoGrid.querySelectorAll(".video-card.remote");
+  cards.forEach(c => c.remove());
+
+  // Clean local streams
+  if (localStream) {
+    localStream.getTracks().forEach(t => t.stop());
+  }
+
+  // Reset local state
+  roomId = "";
+  userId = "";
+  username = "";
+  lastEventId = 0;
+  peerConnections;
+  sequence = [];
+  predictionQueue = [];
+
+  // Reset UI View
+  roomBadge.classList.add("hidden");
+  roomHeaderStatus.textContent = "Lobby";
+  meetingScreen.classList.remove("active");
+  lobbyScreen.classList.add("active");
+  currentScreen = "lobby";
+
+  // Re-enable lobby camera preview
+  cameraOn = true;
+  micOn = true;
+  lobbyCamToggle.classList.remove("muted");
+  lobbyCamToggle.textContent = "📹";
+  lobbyMicToggle.classList.remove("muted");
+  lobbyMicToggle.textContent = "🎙️";
+  startLobbyPreview();
+}
+
+function startSyncIntervals() {
+  // Sync events every 1 second (1000ms)
+  pollInterval = setInterval(pollEvents, 1000);
+  
+  // Heartbeat every 4 seconds
+  heartbeatInterval = setInterval(sendHeartbeat, 4000);
+}
+
+function stopSyncIntervals() {
+  clearInterval(pollInterval);
+  clearInterval(heartbeatInterval);
+}
+
+async function sendHeartbeat() {
+  if (!roomId || !userId) return;
+  try {
+    await fetch(`/api/rooms/${roomId}/heartbeat`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ user_id: userId })
+    });
+  } catch (err) {
+    console.error("Heartbeat error:", err);
+  }
+}
+
+// Broadcast client action/media changes to room
+async function sendEvent(eventType, eventData = {}, recipient = null) {
+  if (!roomId || !userId) return;
+  try {
+    await fetch(`/api/rooms/${roomId}/events`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        user_id: userId,
+        event_type: eventType,
+        data: eventData,
+        recipient: recipient
+      })
+    });
+  } catch (err) {
+    console.error("Post event error:", err);
+  }
+}
+
+// ==========================================================================
+// HTTP POLLING EVENT SYNCER
+// ==========================================================================
+
+async function pollEvents() {
+  if (!roomId || !userId) return;
+  try {
+    const response = await fetch(`/api/rooms/${roomId}/events?user_id=${userId}&last_event_id=${lastEventId}`);
+    if (!response.ok) return;
+
+    const data = await response.json();
+    if (data.events && data.events.length > 0) {
+      data.events.forEach(event => {
+        handleReceivedEvent(event);
+        lastEventId = Math.max(lastEventId, event.id);
+      });
+    }
+  } catch (err) {
+    console.error("Polling events error:", err);
+  }
+}
+
+function handleReceivedEvent(event) {
+  const { type, sender, sender_name, data } = event;
+
+  // Don't process our own broadcasted events unless they are targeted reflections
+  if (sender === userId) return;
+
+  switch (type) {
+    case "join":
+      addSystemMessage(`${sender_name} joined the room.`);
+      // Add empty video card placeholder
+      createParticipantCardPlaceholder(sender, sender_name);
+      break;
+
+    case "leave":
+      addSystemMessage(`${sender_name} left the room.`);
+      removeParticipantCard(sender);
+      break;
+
+    case "chat":
+      addChatMessage(sender_name, data.message, false);
+      break;
+
+    case "dialogue":
+      showDialogueBubble(sender, sender_name, data.word);
+      break;
+
+    case "media_state":
+      updateParticipantMediaUI(sender, data.media_type, data.enabled);
+      break;
+
+    case "webrtc_signal":
+      handleWebRTCSignal(sender, sender_name, data);
+      break;
+  }
+}
+
+// ==========================================================================
+// WEBRTC MESH IMPLEMENTATION
+// ==========================================================================
+
+function initiatePeerConnection(targetUserId, targetUserName, isOfferCreator) {
+  // If PC already exists, close it first
+  if (peerConnections[targetUserId]) {
+    peerConnections[targetUserId].close();
+  }
+
+  const pc = new RTCPeerConnection({
+    iceServers: [
+      { urls: "stun:stun.l.google.com:19302" },
+      { urls: "stun:stun1.l.google.com:19302" },
+      { urls: "stun:stun2.l.google.com:19302" }
+    ]
+  });
+
+  peerConnections[targetUserId] = pc;
+
+  // Add our local tracks to the connection
+  if (localStream) {
+    localStream.getTracks().forEach(track => {
+      pc.addTrack(track, localStream);
+    });
+  }
+
+  // ICE candidates callback
+  pc.onicecandidate = (e) => {
+    if (e.candidate) {
+      sendEvent("webrtc_signal", { candidate: e.candidate }, targetUserId);
+    }
+  };
+
+  // Remote track received callback
+  pc.ontrack = (e) => {
+    const remoteStream = e.streams[0];
+    addRemoteParticipantCard(targetUserId, targetUserName, remoteStream);
+  };
+
+  // Negotiation handler (Only run if we are the connection initiator)
+  if (isOfferCreator) {
+    pc.onnegotiationneeded = async () => {
+      try {
+        const offer = await pc.createOffer();
+        await pc.setLocalDescription(offer);
+        sendEvent("webrtc_signal", { sdp: offer }, targetUserId);
+      } catch (err) {
+        console.error("Error creating WebRTC offer:", err);
+      }
+    };
+  }
+
+  return pc;
+}
+
+async function handleWebRTCSignal(senderId, senderName, signalData) {
+  let pc = peerConnections[senderId];
+
+  // Receive Session SDP Offer or Answer
+  if (signalData.sdp) {
+    const sessionDesc = signalData.sdp;
+
+    if (sessionDesc.type === "offer") {
+      // Receiver initializes peer connection passively (not the initiator)
+      pc = initiatePeerConnection(senderId, senderName, false);
+      await pc.setRemoteDescription(new RTCSessionDescription(sessionDesc));
+
+      const answer = await pc.createAnswer();
+      await pc.setLocalDescription(answer);
+      sendEvent("webrtc_signal", { sdp: answer }, senderId);
+    } 
+    else if (sessionDesc.type === "answer") {
+      if (pc) {
+        await pc.setRemoteDescription(new RTCSessionDescription(sessionDesc));
+      }
+    }
+  } 
+  // Receive ICE Candidate
+  else if (signalData.candidate) {
+    if (pc) {
+      try {
+        await pc.addIceCandidate(new RTCIceCandidate(signalData.candidate));
+      } catch (err) {
+        console.error("Error adding received ICE candidate:", err);
+      }
+    }
+  }
+}
+
+// ==========================================================================
+// PARTICIPANT CARD RENDERERS
+// ==========================================================================
+
+function createParticipantCardPlaceholder(targetUserId, targetUserName) {
+  // Check if card exists
+  let card = document.getElementById(`video-card-${targetUserId}`);
+  if (!card) {
+    card = document.createElement("div");
+    card.id = `video-card-${targetUserId}`;
+    card.className = "video-card remote camera-off";
+    
+    // Placeholder initials
+    const initials = targetUserName.slice(0, 2).toUpperCase();
+    card.setAttribute("data-initials", initials);
+
+    const video = document.createElement("video");
+    video.autoplay = true;
+    video.playsInline = true;
+
+    const info = document.createElement("div");
+    info.className = "video-info";
+
+    const nameBadge = document.createElement("span");
+    nameBadge.className = "username-badge";
+    nameBadge.textContent = targetUserName;
+
+    const indicators = document.createElement("div");
+    indicators.className = "stream-indicators";
+
+    const micIndicator = document.createElement("span");
+    micIndicator.id = `mic-indicator-${targetUserId}`;
+    micIndicator.className = "indicator hidden";
+    micIndicator.textContent = "🎙️ Muted";
+
+    indicators.appendChild(micIndicator);
+    info.appendChild(nameBadge);
+    info.appendChild(indicators);
+
+    const dialogueBubble = document.createElement("div");
+    dialogueBubble.id = `dialogue-bubble-${targetUserId}`;
+    dialogueBubble.className = "dialogue-bubble hidden";
+
+    card.appendChild(video);
+    card.appendChild(info);
+    card.appendChild(dialogueBubble);
+
+    videoGrid.appendChild(card);
+  }
+}
+
+function addRemoteParticipantCard(targetUserId, targetUserName, stream) {
+  createParticipantCardPlaceholder(targetUserId, targetUserName);
+  
+  const card = document.getElementById(`video-card-${targetUserId}`);
+  if (card) {
+    const video = card.querySelector("video");
+    if (video && video.srcObject !== stream) {
+      video.srcObject = stream;
+      video.play();
+    }
+    // Remove camera off placeholder status once stream is rendering
+    card.classList.remove("camera-off");
+  }
+}
+
+function removeParticipantCard(targetUserId) {
+  const card = document.getElementById(`video-card-${targetUserId}`);
+  if (card) {
+    card.remove();
+  }
+
+  if (peerConnections[targetUserId]) {
+    peerConnections[targetUserId].close();
+    delete peerConnections[targetUserId];
+  }
+
+  if (bubbleTimers[targetUserId]) {
+    clearTimeout(bubbleTimers[targetUserId]);
+    delete bubbleTimers[targetUserId];
+  }
+}
+
+function updateParticipantMediaUI(targetUserId, mediaType, enabled) {
+  const card = document.getElementById(`video-card-${targetUserId}`);
+  if (!card) return;
+
+  if (mediaType === "camera") {
+    card.classList.toggle("camera-off", !enabled);
+  } 
+  else if (mediaType === "mic") {
+    const micInd = document.getElementById(`mic-indicator-${targetUserId}`);
+    if (micInd) {
+      micInd.classList.toggle("hidden", enabled);
+    }
+  }
+}
+
+// Toggle local camera track
+function toggleLocalCamera() {
+  if (!localStream) return;
+  cameraOn = !cameraOn;
+  localStream.getVideoTracks().forEach(track => track.enabled = cameraOn);
+  
+  cameraToggleBtn.classList.toggle("muted", !cameraOn);
+  cameraToggleBtn.textContent = cameraOn ? "📹" : "❌";
+
+  const localCard = document.getElementById("local-video-card");
+  if (localCard) {
+    localCard.classList.toggle("camera-off", !cameraOn);
+  }
+
+  // Notify peer room
+  sendEvent("media_state", { media_type: "camera", enabled: cameraOn });
+}
+
+// Toggle local mic track
+function toggleLocalMic() {
+  if (!localStream) return;
+  micOn = !micOn;
+  localStream.getAudioTracks().forEach(track => track.enabled = micOn);
+  
+  micToggleBtn.classList.toggle("muted", !micOn);
+  micToggleBtn.textContent = micOn ? "🎙️" : "❌";
+
+  const localMicIndicator = document.getElementById("local-mic-indicator");
+  if (localMicIndicator) {
+    localMicIndicator.classList.toggle("hidden", micOn);
+  }
+
+  // Notify peer room
+  sendEvent("media_state", { media_type: "mic", enabled: micOn });
+}
+
+// ==========================================================================
+// CHAT & TRANSCRIPTION INTERFACE
+// ==========================================================================
+
+function setupEventListeners() {
+  // Lobby join button
+  if (joinMeetingBtn) joinMeetingBtn.addEventListener("click", joinMeeting);
+  if (randomRoomBtn) randomRoomBtn.addEventListener("click", generateRandomRoomId);
+
+  // Lobby cam/mic toggle
+  if (lobbyCamToggle) lobbyCamToggle.addEventListener("click", toggleLobbyCam);
+  if (lobbyMicToggle) lobbyMicToggle.addEventListener("click", toggleLobbyMic);
+
+  // Meeting controls
+  if (micToggleBtn) micToggleBtn.addEventListener("click", toggleLocalMic);
+  if (cameraToggleBtn) cameraToggleBtn.addEventListener("click", toggleLocalCamera);
+  if (recognitionToggleBtn) recognitionToggleBtn.addEventListener("click", () => toggleSignRecognition(!recognitionActive));
+  if (leaveBtn) leaveBtn.addEventListener("click", leaveMeeting);
+
+  // Header copy
+  if (copyRoomBtn) copyRoomBtn.addEventListener("click", copyRoomLink);
+  if (themeToggleBtn) themeToggleBtn.addEventListener("click", toggleTheme);
+
+  // Sidebar toggle & tabs
+  if (sidebarToggleBtn) sidebarToggleBtn.addEventListener("click", toggleSidebar);
+  if (tabChat) tabChat.addEventListener("click", () => switchSidebarTab("chat"));
+  if (tabVocab) tabVocab.addEventListener("click", () => switchSidebarTab("vocab"));
+
+  // Chat message send
+  if (sendChatBtn) sendChatBtn.addEventListener("click", sendChatMessageInput);
+  if (chatInput) {
+    chatInput.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") {
+        sendChatMessageInput();
+      }
+    });
+  }
+}
+
+function copyRoomLink() {
+  navigator.clipboard.writeText(roomId).then(() => {
+    const oldText = copyRoomBtn.textContent;
+    copyRoomBtn.textContent = "Copied!";
+    setTimeout(() => {
+      copyRoomBtn.textContent = oldText;
+    }, 1500);
+  }).catch(err => {
+    console.error("Clipboard copy failed:", err);
   });
 }
 
+function toggleSidebar() {
+  sidebar.classList.toggle("hidden");
+  sidebarToggleBtn.classList.toggle("active", !sidebar.classList.contains("hidden"));
+}
 
-navButtons.forEach((button) => {
-  button.addEventListener("click", () => {
-    showPage(button.dataset.page);
-  });
-});
+function switchSidebarTab(tabName) {
+  if (tabName === "chat") {
+    tabChat.classList.add("active");
+    tabVocab.classList.remove("active");
+    panelChat.classList.add("active");
+    panelVocab.classList.remove("active");
+  } else {
+    tabChat.classList.remove("active");
+    tabVocab.classList.add("active");
+    panelChat.classList.remove("active");
+    panelVocab.classList.add("active");
+  }
+}
 
+function addSystemMessage(text) {
+  const el = document.createElement("div");
+  el.className = "system-message font-outfit";
+  el.textContent = text;
+  chatBox.appendChild(el);
+  chatBox.scrollTop = chatBox.scrollHeight;
+}
 
-// =========================
-// MEDIAPIPE POSE + HANDS
-// =========================
+function addChatMessage(senderName, text, isLocal = false) {
+  const el = document.createElement("div");
+  el.className = `chat-bubble ${isLocal ? 'local' : 'remote'}`;
+  
+  const senderSpan = document.createElement("span");
+  senderSpan.className = "sender-name";
+  senderSpan.textContent = isLocal ? "You" : senderName;
+  
+  const textNode = document.createTextNode(text);
+  
+  el.appendChild(senderSpan);
+  el.appendChild(textNode);
+  chatBox.appendChild(el);
+  chatBox.scrollTop = chatBox.scrollHeight;
+}
 
-let poseResolve = null;
-let handsResolve = null;
+function addSignTranscriptionMessage(senderName, word, isLocal = false) {
+  const el = document.createElement("div");
+  el.className = "chat-bubble sign-translation";
+
+  const tagSpan = document.createElement("span");
+  tagSpan.className = "translation-tag";
+  tagSpan.textContent = isLocal ? "You signed" : `${senderName} signed`;
+
+  const wordSpan = document.createElement("span");
+  wordSpan.textContent = `"${word}"`;
+
+  el.appendChild(tagSpan);
+  el.appendChild(wordSpan);
+  chatBox.appendChild(el);
+  chatBox.scrollTop = chatBox.scrollHeight;
+}
+
+function sendChatMessageInput() {
+  const text = chatInput.value.trim();
+  if (!text) return;
+
+  // Add locally
+  addChatMessage("You", text, true);
+  
+  // Broadcast to room
+  sendEvent("chat", { message: text });
+
+  chatInput.value = "";
+}
+
+// ==========================================================================
+// SPEECH DIALOGUE BUBBLES DISPLAY
+// ==========================================================================
+
+function showDialogueBubble(targetUserId, targetUserName, word) {
+  const bubble = document.getElementById(
+    targetUserId === userId ? "local-dialogue-bubble" : `dialogue-bubble-${targetUserId}`
+  );
+  if (!bubble) return;
+
+  bubble.textContent = word;
+  bubble.classList.remove("hidden");
+
+  // Add speaking class animation to the card border
+  const card = document.getElementById(
+    targetUserId === userId ? "local-video-card" : `video-card-${targetUserId}`
+  );
+  if (card) {
+    card.classList.add("speaking");
+  }
+
+  // Clear previous timer for this bubble
+  if (bubbleTimers[targetUserId]) {
+    clearTimeout(bubbleTimers[targetUserId]);
+  }
+
+  // Fade out bubble after 3 seconds of inactivity
+  bubbleTimers[targetUserId] = setTimeout(() => {
+    bubble.classList.add("hidden");
+    if (card) {
+      card.classList.remove("speaking");
+    }
+  }, 3000);
+
+  // Append word to sidebar transcript log
+  addSignTranscriptionMessage(targetUserName, word, targetUserId === userId);
+}
+
+// ==========================================================================
+// LOCAL MEDIAPIPE LOBBY/MEETING SKELETON TRACKER
+// ==========================================================================
+
+let poseResolveLocal = null;
+let handsResolveLocal = null;
 
 const pose = new Pose({
-  locateFile: function(file) {
-    return `https://cdn.jsdelivr.net/npm/@mediapipe/pose/${file}`;
-  }
+  locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/pose/${file}`
 });
 
 pose.setOptions({
@@ -125,17 +946,14 @@ pose.setOptions({
 });
 
 pose.onResults((results) => {
-  if (poseResolve) {
-    poseResolve(results);
-    poseResolve = null;
+  if (poseResolveLocal) {
+    poseResolveLocal(results);
+    poseResolveLocal = null;
   }
 });
 
-
 const hands = new Hands({
-  locateFile: function(file) {
-    return `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`;
-  }
+  locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`
 });
 
 hands.setOptions({
@@ -147,119 +965,70 @@ hands.setOptions({
 });
 
 hands.onResults((results) => {
-  if (handsResolve) {
-    handsResolve(results);
-    handsResolve = null;
+  if (handsResolveLocal) {
+    handsResolveLocal(results);
+    handsResolveLocal = null;
   }
 });
 
-
 function processPose(image) {
   return new Promise((resolve) => {
-    poseResolve = resolve;
-    pose.send({ image: image });
+    poseResolveLocal = resolve;
+    pose.send({ image: image }).catch(err => {
+      console.error("Pose send error:", err);
+      resolve(null);
+    });
   });
 }
-
 
 function processHands(image) {
   return new Promise((resolve) => {
-    handsResolve = resolve;
-    hands.send({ image: image });
+    handsResolveLocal = resolve;
+    hands.send({ image: image }).catch(err => {
+      console.error("Hands send error:", err);
+      resolve(null);
+    });
   });
 }
 
-
-// =========================
-// FRAME PREPROCESSING
-// =========================
-
-function prepareProcessingFrame() {
-  processCtx.save();
-  processCtx.clearRect(0, 0, CAMERA_WIDTH, CAMERA_HEIGHT);
-
-  // Same idea as Python cv2.flip(frame, 1)
-  processCtx.translate(CAMERA_WIDTH, 0);
-  processCtx.scale(-1, 1);
-
-  processCtx.drawImage(
-    videoElement,
-    0,
-    0,
-    CAMERA_WIDTH,
-    CAMERA_HEIGHT
-  );
-
-  processCtx.restore();
-}
-
-
-function flattenLandmarks(landmarks, landmarkCount) {
-  const output = [];
-
+// Flattens MediaPipe landmark points to simple array
+function flattenLandmarks(landmarks, count) {
   if (!landmarks) {
-    return new Array(landmarkCount * 3).fill(0);
+    return new Array(count * 3).fill(0);
   }
-
-  for (let i = 0; i < landmarkCount; i++) {
-    const point = landmarks[i];
-
-    if (!point) {
-      output.push(0, 0, 0);
+  const arr = [];
+  for (let i = 0; i < count; i++) {
+    const pt = landmarks[i];
+    if (!pt) {
+      arr.push(0, 0, 0);
     } else {
-      output.push(
-        point.x || 0,
-        point.y || 0,
-        point.z || 0
-      );
+      arr.push(pt.x || 0, pt.y || 0, pt.z || 0);
     }
   }
-
-  return output;
+  return arr;
 }
 
-
 function getHandLabel(handedness) {
-  if (!handedness) {
-    return "";
-  }
-
-  if (handedness.label) {
-    return handedness.label;
-  }
-
-  if (
-    handedness.classification &&
-    handedness.classification[0] &&
-    handedness.classification[0].label
-  ) {
+  if (!handedness) return "";
+  if (handedness.label) return handedness.label;
+  if (handedness.classification && handedness.classification[0]) {
     return handedness.classification[0].label;
   }
-
   return "";
 }
 
-
 function extractKeypoints(poseResults, handsResults) {
-  const poseKp = flattenLandmarks(poseResults.poseLandmarks, 33);
-
+  const poseKp = flattenLandmarks(poseResults ? poseResults.poseLandmarks : null, 33);
   let leftHandKp = new Array(21 * 3).fill(0);
   let rightHandKp = new Array(21 * 3).fill(0);
 
-  if (handsResults.multiHandLandmarks && handsResults.multiHandLandmarks.length > 0) {
+  if (handsResults && handsResults.multiHandLandmarks && handsResults.multiHandLandmarks.length > 0) {
     for (let i = 0; i < handsResults.multiHandLandmarks.length; i++) {
       const handLandmarks = handsResults.multiHandLandmarks[i];
-
-      const handedness = handsResults.multiHandedness
-        ? handsResults.multiHandedness[i]
-        : null;
-
+      const handedness = handsResults.multiHandedness ? handsResults.multiHandedness[i] : null;
       const label = getHandLabel(handedness);
       const kp = flattenLandmarks(handLandmarks, 21);
 
-      // Same logic as your working Python:
-      // label Left -> left hand slot
-      // otherwise -> right hand slot
       if (label === "Left") {
         leftHandKp = kp;
       } else {
@@ -268,157 +1037,18 @@ function extractKeypoints(poseResults, handsResults) {
     }
   }
 
-  return [
-    ...poseKp,
-    ...leftHandKp,
-    ...rightHandKp
-  ];
+  return [...poseKp, ...leftHandKp, ...rightHandKp];
 }
 
-
-// =========================
-// ARTISTIC CAMERA HUD
-// =========================
-
-function drawRoundedRect(ctx, x, y, width, height, radius) {
-  ctx.beginPath();
-  ctx.moveTo(x + radius, y);
-  ctx.lineTo(x + width - radius, y);
-  ctx.quadraticCurveTo(x + width, y, x + width, y + radius);
-  ctx.lineTo(x + width, y + height - radius);
-  ctx.quadraticCurveTo(x + width, y + height, x + width - radius, y + height);
-  ctx.lineTo(x + radius, y + height);
-  ctx.quadraticCurveTo(x, y + height, x, y + height - radius);
-  ctx.lineTo(x, y + radius);
-  ctx.quadraticCurveTo(x, y, x + radius, y);
-  ctx.closePath();
+// Flip frame left-to-right (mimics cv2.flip(frame, 1))
+function prepareProcessingFrame() {
+  processCtx.save();
+  processCtx.clearRect(0, 0, CAMERA_WIDTH, CAMERA_HEIGHT);
+  processCtx.translate(CAMERA_WIDTH, 0);
+  processCtx.scale(-1, 1);
+  processCtx.drawImage(webcamElement, 0, 0, CAMERA_WIDTH, CAMERA_HEIGHT);
+  processCtx.restore();
 }
-
-
-function drawHudBackground() {
-  const barHeight = 105;
-
-  const gradient = canvasCtx.createLinearGradient(0, 0, CAMERA_WIDTH, 0);
-  gradient.addColorStop(0, "rgba(2, 6, 23, 0.92)");
-  gradient.addColorStop(0.5, "rgba(6, 78, 59, 0.88)");
-  gradient.addColorStop(1, "rgba(2, 6, 23, 0.92)");
-
-  canvasCtx.save();
-
-  canvasCtx.fillStyle = gradient;
-  canvasCtx.fillRect(0, 0, CAMERA_WIDTH, barHeight);
-
-  canvasCtx.strokeStyle = "rgba(16, 185, 129, 0.9)";
-  canvasCtx.lineWidth = 2;
-  canvasCtx.beginPath();
-  canvasCtx.moveTo(0, barHeight);
-  canvasCtx.lineTo(CAMERA_WIDTH, barHeight);
-  canvasCtx.stroke();
-
-  canvasCtx.fillStyle = "rgba(255, 255, 255, 0.08)";
-  drawRoundedRect(canvasCtx, 12, 13, CAMERA_WIDTH - 24, 78, 14);
-  canvasCtx.fill();
-
-  canvasCtx.restore();
-}
-
-
-function drawTopBar() {
-  drawHudBackground();
-
-  const top1Percent = Math.round(lastPredictionInfo.top1Confidence * 100);
-  const top2Percent = Math.round(lastPredictionInfo.top2Confidence * 100);
-  const top3Percent = Math.round(lastPredictionInfo.top3Confidence * 100);
-  const marginPercent = Math.round(lastPredictionInfo.margin * 100);
-
-  const mainText = lastPredictionInfo.accepted
-    ? `1st: ${lastPredictionInfo.top1} (${top1Percent}%)`
-    : `Not sure (${top1Percent}%)`;
-
-  canvasCtx.save();
-
-  canvasCtx.font = "bold 20px Arial";
-  canvasCtx.fillStyle = lastPredictionInfo.accepted ? "#34d399" : "#facc15";
-  canvasCtx.fillText(mainText, 25, 38);
-
-  canvasCtx.font = "15px Arial";
-  canvasCtx.fillStyle = "#a7f3d0";
-  canvasCtx.fillText(
-    `2nd: ${lastPredictionInfo.top2} (${top2Percent}%)`,
-    25,
-    66
-  );
-
-  canvasCtx.fillStyle = "#67e8f9";
-  canvasCtx.fillText(
-    `3rd: ${lastPredictionInfo.top3} (${top3Percent}%)`,
-    255,
-    66
-  );
-
-  canvasCtx.fillStyle = "#ffffff";
-  canvasCtx.fillText(
-    `Difference: ${marginPercent}%`,
-    470,
-    66
-  );
-
-  const meterWidth = 220;
-  const filledWidth = Math.max(
-    0,
-    Math.min(meterWidth, lastPredictionInfo.top1Confidence * meterWidth)
-  );
-
-  drawRoundedRect(canvasCtx, 25, 82, meterWidth, 8, 6);
-  canvasCtx.fillStyle = "rgba(255, 255, 255, 0.18)";
-  canvasCtx.fill();
-
-  drawRoundedRect(canvasCtx, 25, 82, filledWidth, 8, 6);
-  canvasCtx.fillStyle = "#34d399";
-  canvasCtx.fill();
-
-  canvasCtx.font = "bold 12px Arial";
-  canvasCtx.fillStyle = "#d1fae5";
-  canvasCtx.fillText("HANDS ONLY + LSTM", CAMERA_WIDTH - 145, 28);
-
-  canvasCtx.restore();
-}
-
-
-function drawCornerFrame(x, y, width, height) {
-  const length = 26;
-
-  canvasCtx.save();
-  canvasCtx.strokeStyle = "#34d399";
-  canvasCtx.lineWidth = 3;
-  canvasCtx.lineCap = "round";
-
-  canvasCtx.beginPath();
-
-  // top left
-  canvasCtx.moveTo(x, y + length);
-  canvasCtx.lineTo(x, y);
-  canvasCtx.lineTo(x + length, y);
-
-  // top right
-  canvasCtx.moveTo(x + width - length, y);
-  canvasCtx.lineTo(x + width, y);
-  canvasCtx.lineTo(x + width, y + length);
-
-  // bottom right
-  canvasCtx.moveTo(x + width, y + height - length);
-  canvasCtx.lineTo(x + width, y + height);
-  canvasCtx.lineTo(x + width - length, y + height);
-
-  // bottom left
-  canvasCtx.moveTo(x + length, y + height);
-  canvasCtx.lineTo(x, y + height);
-  canvasCtx.lineTo(x, y + height - length);
-
-  canvasCtx.stroke();
-  canvasCtx.restore();
-}
-
 
 function drawHandBox(handLandmarks) {
   const xs = handLandmarks.map((lm) => lm.x * CAMERA_WIDTH);
@@ -432,93 +1062,66 @@ function drawHandBox(handLandmarks) {
   const boxWidth = xMax - xMin;
   const boxHeight = yMax - yMin;
 
-  if (boxWidth <= 0 || boxHeight <= 0) {
-    return;
-  }
+  if (boxWidth <= 0 || boxHeight <= 0) return;
 
   const size = Math.max(boxWidth, boxHeight);
   const cx = (xMin + xMax) / 2;
   const cy = (yMin + yMax) / 2;
-  const half = size / 2 + 18;
+  const half = size / 2 + 15;
 
   const x1 = Math.max(0, cx - half);
   const y1 = Math.max(0, cy - half);
   const x2 = Math.min(CAMERA_WIDTH, cx + half);
   const y2 = Math.min(CAMERA_HEIGHT, cy + half);
 
+  // Modern cyber-glowing bounding box
   canvasCtx.save();
-
-  canvasCtx.shadowColor = "rgba(52, 211, 153, 0.9)";
-  canvasCtx.shadowBlur = 18;
-
-  canvasCtx.strokeStyle = "rgba(52, 211, 153, 0.38)";
-  canvasCtx.lineWidth = 1;
-  drawRoundedRect(canvasCtx, x1, y1, x2 - x1, y2 - y1, 16);
+  canvasCtx.shadowColor = "rgba(16, 185, 129, 0.8)";
+  canvasCtx.shadowBlur = 12;
+  canvasCtx.strokeStyle = "rgba(16, 185, 129, 0.4)";
+  canvasCtx.lineWidth = 2;
+  
+  // Draw rounded card borders
+  canvasCtx.beginPath();
+  const radius = 10;
+  canvasCtx.roundRect(x1, y1, x2 - x1, y2 - y1, radius);
   canvasCtx.stroke();
-
-  drawCornerFrame(x1, y1, x2 - x1, y2 - y1);
-
   canvasCtx.restore();
 }
 
-
 function drawDisplayFrame(poseResults, handsResults) {
+  if (!canvasElement || !canvasCtx) return;
+  
   canvasElement.width = CAMERA_WIDTH;
   canvasElement.height = CAMERA_HEIGHT;
-
   canvasCtx.clearRect(0, 0, CAMERA_WIDTH, CAMERA_HEIGHT);
 
-  // Draw the already-flipped processing frame.
-  canvasCtx.drawImage(
-    processCanvas,
-    0,
-    0,
-    CAMERA_WIDTH,
-    CAMERA_HEIGHT
-  );
-
-  // Dark cinematic vignette
-  const vignette = canvasCtx.createRadialGradient(
-    CAMERA_WIDTH / 2,
-    CAMERA_HEIGHT / 2,
-    90,
-    CAMERA_WIDTH / 2,
-    CAMERA_HEIGHT / 2,
-    CAMERA_WIDTH / 1.05
-  );
-
-  vignette.addColorStop(0, "rgba(0, 0, 0, 0)");
-  vignette.addColorStop(1, "rgba(0, 0, 0, 0.34)");
-
-  canvasCtx.fillStyle = vignette;
-  canvasCtx.fillRect(0, 0, CAMERA_WIDTH, CAMERA_HEIGHT);
-
-  drawTopBar();
-
-  // Draw only hand landmarks + hand boxes
-  if (handsResults.multiHandLandmarks && handsResults.multiHandLandmarks.length > 0) {
+  // Draw hand connections with simple neon green
+  if (handsResults && handsResults.multiHandLandmarks && handsResults.multiHandLandmarks.length > 0) {
     handsResults.multiHandLandmarks.forEach((handLandmarks) => {
+      // Connectors
       drawConnectors(canvasCtx, handLandmarks, HAND_CONNECTIONS, {
-        color: "#facc15",
-        lineWidth: 1
+        color: "#10b981",
+        lineWidth: 2
       });
 
+      // Joint points
       drawLandmarks(canvasCtx, handLandmarks, {
         color: "#00ffff",
-        fillColor: "#00ffff",
+        fillColor: "#10b981",
         radius: 2,
         lineWidth: 1
       });
 
+      // Bounding box
       drawHandBox(handLandmarks);
     });
   }
 }
 
-
-// =========================
-// PREDICTION SMOOTHING
-// =========================
+// ==========================================================================
+// PREDICTION WORKFLOW (CLIENT LANDMARKS -> FLASK MODEL)
+// ==========================================================================
 
 function smoothPrediction(data) {
   predictionQueue.push({
@@ -536,14 +1139,12 @@ function smoothPrediction(data) {
   }
 
   const counts = {};
-
   predictionQueue.forEach((item) => {
     counts[item.word] = (counts[item.word] || 0) + 1;
   });
 
   let bestWord = data.word;
   let bestCount = 0;
-
   Object.keys(counts).forEach((word) => {
     if (counts[word] > bestCount) {
       bestWord = word;
@@ -554,11 +1155,8 @@ function smoothPrediction(data) {
   const matching = predictionQueue.filter((item) => item.word === bestWord);
   const latest = matching[matching.length - 1];
 
-  const avgConfidence =
-    matching.reduce((sum, item) => sum + item.confidence, 0) / matching.length;
-
-  const avgMargin =
-    matching.reduce((sum, item) => sum + item.margin, 0) / matching.length;
+  const avgConfidence = matching.reduce((sum, item) => sum + item.confidence, 0) / matching.length;
+  const avgMargin = matching.reduce((sum, item) => sum + item.margin, 0) / matching.length;
 
   return {
     word: bestWord,
@@ -571,14 +1169,11 @@ function smoothPrediction(data) {
   };
 }
 
-
 function isPredictionSure(prediction) {
   const confidentEnough = prediction.confidence >= CONFIDENCE_THRESHOLD;
   const marginEnough = prediction.margin >= MINIMUM_PREDICTION_MARGIN;
-
   return confidentEnough && marginEnough;
 }
-
 
 function confirmStablePrediction(word) {
   if (pendingPrediction.word === word) {
@@ -587,45 +1182,19 @@ function confirmStablePrediction(word) {
     pendingPrediction.word = word;
     pendingPrediction.count = 1;
   }
-
   return pendingPrediction.count >= REQUIRED_STABLE_PREDICTIONS;
 }
-
 
 function resetPredictionStability() {
   pendingPrediction.word = "";
   pendingPrediction.count = 0;
 }
 
-
-function addWordToSentence(word) {
-  const now = Date.now();
-
-  if (word === lastAddedWord && now - lastAddedTime < WORD_REPEAT_DELAY_MS) {
-    return;
-  }
-
-  lastAddedWord = word;
-  lastAddedTime = now;
-
-  if (sentenceInput.value.trim().length === 0) {
-    sentenceInput.value = word;
-  } else {
-    sentenceInput.value += " " + word;
-  }
-}
-
-
 async function sendPrediction() {
-  if (isPredicting) {
-    return;
-  }
+  if (isPredicting) return;
 
   const now = Date.now();
-
-  if (now - lastPredictionTime < PREDICTION_INTERVAL_MS) {
-    return;
-  }
+  if (now - lastPredictionTime < PREDICTION_INTERVAL_MS) return;
 
   lastPredictionTime = now;
   isPredicting = true;
@@ -633,280 +1202,121 @@ async function sendPrediction() {
   try {
     const response = await fetch("/predict", {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify({
-        sequence: sequence
-      })
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ sequence: sequence })
     });
 
-    const data = await response.json();
-
     if (!response.ok) {
-      console.error("Prediction error:", data);
-
-      statusElement.textContent =
-        `Backend error: ${data.error}. Received ${data.received}, expected ${data.expected}.`;
-
       isPredicting = false;
       return;
     }
 
+    const data = await response.json();
     const smoothed = smoothPrediction(data);
     const sure = isPredictionSure(smoothed);
-
-    lastPredictionInfo = {
-      top1: smoothed.word,
-      top1Confidence: smoothed.confidence,
-      top2: smoothed.top2Word,
-      top2Confidence: smoothed.top2Confidence,
-      top3: smoothed.top3Word,
-      top3Confidence: smoothed.top3Confidence,
-      margin: smoothed.margin,
-      accepted: sure
-    };
-
-    const confidencePercent = Math.round(smoothed.confidence * 100);
-    const marginPercent = Math.round(smoothed.margin * 100);
 
     if (sure) {
       const stable = confirmStablePrediction(smoothed.word);
 
-      statusElement.textContent =
-        `Checking: ${smoothed.word} (${pendingPrediction.count}/${REQUIRED_STABLE_PREDICTIONS}) | Confidence: ${confidencePercent}% | Difference: ${marginPercent}%`;
-
       if (stable) {
-        addWordToSentence(smoothed.word);
+        // Prevent immediate duplicates
+        if (smoothed.word !== lastAddedWord || now - lastAddedTime > WORD_REPEAT_DELAY_MS) {
+          lastAddedWord = smoothed.word;
+          lastAddedTime = now;
+          
+          // Display bubble locally
+          showDialogueBubble(userId, username, smoothed.word);
+          
+          // Broadcast to meeting peers
+          sendEvent("dialogue", { word: smoothed.word });
+        }
         resetPredictionStability();
-
-        statusElement.textContent =
-          `Recognized: ${smoothed.word} | Confidence: ${confidencePercent}%`;
       }
     } else {
       resetPredictionStability();
-
-      statusElement.textContent =
-        `Not sure: ${smoothed.word} vs ${smoothed.top2Word} | Confidence: ${confidencePercent}% | Difference: ${marginPercent}%`;
     }
-
   } catch (error) {
-    console.error("Server error:", error);
-    statusElement.textContent = "Could not connect to Flask server.";
+    console.error("Prediction API error:", error);
   }
 
   isPredicting = false;
 }
 
+// Core loop processing video frames
+async function frameLoop() {
+  if (!frameLoopActive || currentScreen !== "meeting") return;
 
-// =========================
-// MAIN FRAME LOOP
-// =========================
+  // Make sure we have a track running
+  if (webcamElement && webcamElement.readyState === webcamElement.HAVE_ENOUGH_DATA) {
+    prepareProcessingFrame();
 
-async function processCurrentFrame() {
-  prepareProcessingFrame();
+    // Extract landmarks
+    const poseResults = await processPose(processCanvas);
+    const handsResults = await processHands(processCanvas);
 
-  const poseResults = await processPose(processCanvas);
-  const handsResults = await processHands(processCanvas);
+    // Render skeleton
+    drawDisplayFrame(poseResults, handsResults);
 
-  drawDisplayFrame(poseResults, handsResults);
+    // Prediction sequence building
+    if (recognitionActive && cameraOn) {
+      const hasHand = handsResults && handsResults.multiHandLandmarks && handsResults.multiHandLandmarks.length > 0;
 
-  const hasHand =
-    handsResults.multiHandLandmarks &&
-    handsResults.multiHandLandmarks.length > 0;
+      if (!hasHand) {
+        sequence = [];
+        predictionQueue = [];
+        resetPredictionStability();
+        updateStatusIndicator("Show hands inside camera");
+      } else {
+        const keypoints = extractKeypoints(poseResults, handsResults);
+        if (keypoints.length === NUM_FEATURES) {
+          sequence.push(keypoints);
+          if (sequence.length > SEQUENCE_LENGTH) {
+            sequence.shift();
+          }
 
-  if (!hasHand) {
+          if (sequence.length < SEQUENCE_LENGTH) {
+            updateStatusIndicator(`Buffering: ${sequence.length}/${SEQUENCE_LENGTH}`);
+          } else {
+            updateStatusIndicator("Translating signs...");
+            await sendPrediction();
+          }
+        }
+      }
+    } else {
+      // Clear queues when recognition is off
+      sequence = [];
+      predictionQueue = [];
+      resetPredictionStability();
+    }
+  }
+
+  // Schedule the next frame ONLY after the current frame finishes processing!
+  if (frameLoopActive) {
+    requestAnimationFrame(frameLoop);
+  }
+}
+
+function updateStatusIndicator(status) {
+  if (recognitionStatusText) {
+    recognitionStatusText.textContent = recognitionActive ? status : "Model Standby";
+  }
+}
+
+function toggleSignRecognition(forceState = null) {
+  recognitionActive = forceState !== null ? forceState : !recognitionActive;
+  
+  body.classList.toggle("recognition-active", recognitionActive);
+  recognitionToggleBtn.classList.toggle("muted", !recognitionActive);
+  recognitionToggleBtn.textContent = recognitionActive ? "🤖" : "❌";
+  
+  updateStatusIndicator(recognitionActive ? "Active" : "Model Standby");
+
+  if (!recognitionActive) {
     sequence = [];
     predictionQueue = [];
     resetPredictionStability();
-
-    lastPredictionInfo.accepted = false;
-    lastPredictionInfo.top1Confidence = 0;
-    lastPredictionInfo.top2Confidence = 0;
-    lastPredictionInfo.top3Confidence = 0;
-    lastPredictionInfo.margin = 0;
-
-    statusElement.textContent = "Show your hand clearly inside the camera frame.";
-    return;
-  }
-
-  const keypoints = extractKeypoints(poseResults, handsResults);
-
-  if (keypoints.length !== NUM_FEATURES) {
-    statusElement.textContent =
-      `Wrong feature length. Got ${keypoints.length}, expected ${NUM_FEATURES}.`;
-
-    return;
-  }
-
-  sequence.push(keypoints);
-
-  if (sequence.length > SEQUENCE_LENGTH) {
-    sequence.shift();
-  }
-
-  if (sequence.length < SEQUENCE_LENGTH) {
-    statusElement.textContent =
-      `Collecting frames: ${sequence.length}/${SEQUENCE_LENGTH}`;
-
-    return;
-  }
-
-  sendPrediction();
-}
-
-
-// =========================
-// CAMERA CONTROL
-// =========================
-
-async function startCamera() {
-  if (cameraStarted) {
-    return;
-  }
-
-  camera = new Camera(videoElement, {
-    onFrame: async function() {
-      await processCurrentFrame();
-    },
-    width: CAMERA_WIDTH,
-    height: CAMERA_HEIGHT
-  });
-
-  await camera.start();
-
-  cameraStarted = true;
-  cameraBtn.textContent = "Camera Off";
-  statusElement.textContent = "Camera started.";
-}
-
-
-function stopCamera() {
-  if (!cameraStarted || !camera) {
-    return;
-  }
-
-  camera.stop();
-
-  cameraStarted = false;
-  cameraBtn.textContent = "Camera On";
-  statusElement.textContent = "Camera stopped.";
-
-  sequence = [];
-  predictionQueue = [];
-  resetPredictionStability();
-
-  lastPredictionInfo = {
-    top1: "--",
-    top1Confidence: 0,
-    top2: "--",
-    top2Confidence: 0,
-    top3: "--",
-    top3Confidence: 0,
-    margin: 0,
-    accepted: false
-  };
-
-  canvasCtx.clearRect(0, 0, canvasElement.width, canvasElement.height);
-}
-
-
-cameraBtn.addEventListener("click", async () => {
-  try {
-    if (cameraStarted) {
-      stopCamera();
-    } else {
-      await startCamera();
+    if (canvasCtx) {
+      canvasCtx.clearRect(0, 0, canvasElement.width, canvasElement.height);
     }
-  } catch (error) {
-    console.error("Camera error:", error);
-
-    statusElement.textContent =
-      "Camera failed. Allow camera permission and use localhost.";
   }
-});
-
-
-// =========================
-// BUTTONS
-// =========================
-
-backspaceBtn.addEventListener("click", () => {
-  sentenceInput.value = sentenceInput.value.trim().slice(0, -1);
-});
-
-
-spaceBtn.addEventListener("click", () => {
-  sentenceInput.value += " ";
-});
-
-
-clearSentenceBtn.addEventListener("click", () => {
-  sentenceInput.value = "";
-  predictionQueue = [];
-  resetPredictionStability();
-});
-
-
-clearChatBtn.addEventListener("click", () => {
-  chatBox.innerHTML = "";
-});
-
-
-sendBtn.addEventListener("click", () => {
-  const text = sentenceInput.value.trim();
-
-  if (!text) {
-    return;
-  }
-
-  const message = document.createElement("div");
-  message.className = "chat-message";
-  message.textContent = text;
-
-  chatBox.appendChild(message);
-  chatBox.scrollTop = chatBox.scrollHeight;
-
-  sentenceInput.value = "";
-  predictionQueue = [];
-  resetPredictionStability();
-});
-
-// =========================
-// IMAGE POPUP FOR METRICS
-// =========================
-
-const imagePopup = document.getElementById("imagePopup");
-const popupImage = document.getElementById("popupImage");
-const closePopup = document.getElementById("closePopup");
-
-if (imagePopup && popupImage && closePopup) {
-  document.querySelectorAll(".metric-image-box img").forEach((image) => {
-    image.addEventListener("click", () => {
-      popupImage.src = image.src;
-      popupImage.alt = image.alt;
-      imagePopup.classList.add("active");
-      imagePopup.setAttribute("aria-hidden", "false");
-    });
-  });
-
-  function closeImagePopup() {
-    imagePopup.classList.remove("active");
-    imagePopup.setAttribute("aria-hidden", "true");
-    popupImage.src = "";
-  }
-
-  closePopup.addEventListener("click", closeImagePopup);
-
-  imagePopup.addEventListener("click", (event) => {
-    if (event.target === imagePopup) {
-      closeImagePopup();
-    }
-  });
-
-  document.addEventListener("keydown", (event) => {
-    if (event.key === "Escape") {
-      closeImagePopup();
-    }
-  });
 }
