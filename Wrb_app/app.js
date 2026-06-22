@@ -155,73 +155,48 @@ function generateRandomRoomId() {
 }
 
 // ==========================================================================
+// ==========================================================================
 // CAMERA & MIC CONTROLS (LOBBY & GENERAL)
 // ==========================================================================
 
-async function populateCameraList() {
-  try {
-    let devices = await navigator.mediaDevices.enumerateDevices();
-    let videoDevices = devices.filter(d => d.kind === "videoinput");
-    const cameraSelect = document.getElementById("cameraSelect");
-    if (!cameraSelect) return;
+async function startLobbyPreview() {
+  // Stop any existing lobby stream first
+  if (lobbyStream) {
+    lobbyStream.getTracks().forEach(t => t.stop());
+    lobbyStream = null;
+  }
 
-    // If no devices are returned, request permission to prompt the browser and re-enumerate
-    if (videoDevices.length === 0) {
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { width: { ideal: CAMERA_WIDTH }, height: { ideal: CAMERA_HEIGHT } },
+      audio: true
+    });
+
+    lobbyStream = stream;
+
+    if (lobbyWebcam) {
+      lobbyWebcam.srcObject = stream;
+      // muted + autoplay allows browsers to play without gesture requirement
+      lobbyWebcam.muted = true;
       try {
-        const tempStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
-        // stop tracks immediately - just needed to grant permission
-        tempStream.getTracks().forEach(t => t.stop());
-        devices = await navigator.mediaDevices.enumerateDevices();
-        videoDevices = devices.filter(d => d.kind === "videoinput");
-      } catch (permErr) {
-        console.warn("Permission request for devices failed:", permErr);
+        await lobbyWebcam.play();
+      } catch (playErr) {
+        console.warn("Lobby video autoplay blocked, will play on interaction:", playErr);
       }
     }
 
-    const prev = cameraSelect.value;
-    cameraSelect.innerHTML = "";
-    videoDevices.forEach((device, i) => {
-      const opt = document.createElement("option");
-      opt.value = device.deviceId;
-      opt.textContent = device.label || `Camera ${i+1}`;
-      cameraSelect.appendChild(opt);
-    });
-    if (prev) {
-      const exists = Array.from(cameraSelect.options).some(o => o.value === prev);
-      cameraSelect.value = exists ? prev : (cameraSelect.options[0] ? cameraSelect.options[0].value : "");
-    } else {
-      if (cameraSelect.options[0]) cameraSelect.value = cameraSelect.options[0].value;
-    }
-    cameraSelect.onchange = () => {
-      stopLobbyPreview();
-      startLobbyPreview();
-    };
-  } catch (e) {
-    console.warn("Could not enumerate devices:", e);
-  }
-}
+    // Populate camera dropdown after stream is open (labels become available)
+    populateCameraList();
 
-async function startLobbyPreview() {
-  try {
-    await populateCameraList();
-    const cameraSelect = document.getElementById("cameraSelect");
-    const selectedId = cameraSelect && cameraSelect.value ? cameraSelect.value : null;
-    const preferredVideo = selectedId ? { deviceId: { exact: selectedId }, width: CAMERA_WIDTH, height: CAMERA_HEIGHT } : { width: CAMERA_WIDTH, height: CAMERA_HEIGHT };
-    let stream;
-    try {
-      stream = await navigator.mediaDevices.getUserMedia({ video: preferredVideo, audio: true });
-    } catch (err) {
-      console.warn("getUserMedia with selected device failed, retrying default camera:", err);
-      stream = await navigator.mediaDevices.getUserMedia({ video: { width: CAMERA_WIDTH, height: CAMERA_HEIGHT }, audio: true });
-    }
-    lobbyStream = stream;
-    if (lobbyWebcam) {
-      lobbyWebcam.srcObject = lobbyStream;
-      lobbyWebcam.play().catch(e => console.log("Lobby video play error:", e));
-    }
   } catch (err) {
-    console.error("Error accessing camera for lobby preview:", err);
-    alert("Please allow camera and microphone permissions to join the meeting.");
+    console.error("getUserMedia failed for lobby:", err);
+    if (err.name === "NotAllowedError" || err.name === "PermissionDeniedError") {
+      alert("Camera/microphone permission denied. Please allow access in your browser settings and reload the page.");
+    } else if (err.name === "NotFoundError" || err.name === "DevicesNotFoundError") {
+      alert("No camera or microphone found. Please connect a device and try again.");
+    } else {
+      alert(`Could not open camera: ${err.message}`);
+    }
   }
 }
 
@@ -251,53 +226,96 @@ function toggleLobbyMic() {
   lobbyMicToggle.textContent = micOn ? "🎙️" : "❌";
 }
 
-async function startMeetingStream() {
+async function populateCameraList() {
   try {
     const cameraSelect = document.getElementById("cameraSelect");
-    const selectedId = cameraSelect && cameraSelect.value ? cameraSelect.value : null;
-    const preferredVideo = selectedId ? { deviceId: { exact: selectedId }, width: CAMERA_WIDTH, height: CAMERA_HEIGHT } : { width: CAMERA_WIDTH, height: CAMERA_HEIGHT };
-    let stream;
-    try {
-      stream = await navigator.mediaDevices.getUserMedia({ video: preferredVideo, audio: true });
-    } catch (err) {
-      console.warn("getUserMedia with selected device failed, retrying default camera:", err);
-      stream = await navigator.mediaDevices.getUserMedia({ video: { width: CAMERA_WIDTH, height: CAMERA_HEIGHT }, audio: true });
+    if (!cameraSelect) return;
+
+    const devices = await navigator.mediaDevices.enumerateDevices();
+    const videoDevices = devices.filter(d => d.kind === "videoinput");
+
+    const prev = cameraSelect.value;
+    cameraSelect.innerHTML = "";
+    videoDevices.forEach((device, i) => {
+      const opt = document.createElement("option");
+      opt.value = device.deviceId;
+      opt.textContent = device.label || `Camera ${i + 1}`;
+      cameraSelect.appendChild(opt);
+    });
+
+    // Restore previous selection if still available
+    if (prev && Array.from(cameraSelect.options).some(o => o.value === prev)) {
+      cameraSelect.value = prev;
     }
+
+    cameraSelect.onchange = () => {
+      stopLobbyPreview();
+      startLobbyPreview();
+    };
+  } catch (e) {
+    console.warn("Could not enumerate devices:", e);
+  }
+}
+
+async function startMeetingStream() {
+  try {
+    // Open a fresh stream for the meeting (lobby stream is already stopped)
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { width: { ideal: CAMERA_WIDTH }, height: { ideal: CAMERA_HEIGHT } },
+      audio: true
+    });
     localStream = stream;
 
     if (webcamElement) {
+      webcamElement.srcObject = null; // clear old stream first
       webcamElement.srcObject = localStream;
-      await webcamElement.play();
+      webcamElement.muted = true; // mute own preview (no echo)
+      // Play via event listener for cross-browser compatibility
+      await new Promise((resolve) => {
+        webcamElement.onloadedmetadata = async () => {
+          try {
+            await webcamElement.play();
+            resolve();
+          } catch (e) {
+            console.warn("Meeting video play failed:", e);
+            resolve(); // don't block joining on play failure
+          }
+        };
+        // Safety timeout in case onloadedmetadata never fires
+        setTimeout(resolve, 3000);
+      });
     }
 
-    // Apply mic/cam preferences from lobby toggles
+    // Apply mic/cam preferences user set in lobby
     localStream.getVideoTracks().forEach(track => track.enabled = cameraOn);
     localStream.getAudioTracks().forEach(track => track.enabled = micOn);
 
+    // Reflect state in UI
     const localCard = document.getElementById("local-video-card");
-    if (localCard) {
-      localCard.classList.toggle("camera-off", !cameraOn);
-    }
+    if (localCard) localCard.classList.toggle("camera-off", !cameraOn);
     const localMicIndicator = document.getElementById("local-mic-indicator");
-    if (localMicIndicator) {
-      localMicIndicator.classList.toggle("hidden", micOn);
-    }
+    if (localMicIndicator) localMicIndicator.classList.toggle("hidden", micOn);
 
-    // Add local tracks to any already initialized peer connections
-    Object.keys(peerConnections).forEach(targetUserId => {
-      const pc = peerConnections[targetUserId];
+    // Add local tracks to any already pending peer connections
+    Object.values(peerConnections).forEach(pc => {
       localStream.getTracks().forEach(track => {
-        pc.addTrack(track, localStream);
+        const senders = pc.getSenders();
+        const alreadyAdded = senders.some(s => s.track === track);
+        if (!alreadyAdded) pc.addTrack(track, localStream);
       });
     });
 
   } catch (err) {
     console.error("Error starting meeting stream:", err);
-    alert("Could not access camera or microphone for the meeting.");
+    if (err.name === "NotAllowedError" || err.name === "PermissionDeniedError") {
+      alert("Camera/microphone permission denied. Please allow access and try rejoining.");
+    } else {
+      alert(`Could not open camera for meeting: ${err.message}`);
+    }
   }
 }
 
-// ==========================================================================
+// ===========================================================================
 // MEETING LIFE CYCLE: JOIN, HEARTBEAT, LEAVE
 // ==========================================================================
 
@@ -404,9 +422,13 @@ async function leaveMeeting() {
   const cards = videoGrid.querySelectorAll(".video-card.remote");
   cards.forEach(c => c.remove());
 
-  // Clean local streams
+  // Clean local streams and release camera
   if (localStream) {
     localStream.getTracks().forEach(t => t.stop());
+    localStream = null;
+  }
+  if (webcamElement) {
+    webcamElement.srcObject = null;
   }
 
   // Reset local state

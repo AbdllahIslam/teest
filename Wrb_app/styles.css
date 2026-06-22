@@ -306,7 +306,41 @@ main {
   left: 50%;
   transform: translateX(-50%);
   display: flex;
-  gap: 16px;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: nowrap;
+}
+
+/* Camera device selector */
+#cameraSelect {
+  background: rgba(0, 0, 0, 0.55);
+  color: white;
+  border: 1px solid rgba(255,255,255,0.25);
+  padding: 6px 10px;
+  border-radius: 8px;
+  font-size: 12px;
+  max-width: 140px;
+  cursor: pointer;
+  backdrop-filter: blur(8px);
+  outline: none;
+}
+
+#cameraSelect option {
+  background: #1b2640;
+  color: white;
+}
+
+/* Accessible hidden label */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
 }
 
 .control-circle {
