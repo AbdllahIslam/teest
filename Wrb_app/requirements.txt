@@ -3,4 +3,5 @@ flask-cors
 numpy
 h5py
 tensorflow
-gunicorn7. eventlet>=0.33.0
+gunicorn
+eventlet>=0.33.0
