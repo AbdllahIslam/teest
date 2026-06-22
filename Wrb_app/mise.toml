@@ -1,0 +1,5 @@
+[settings]
+python.github_attestations = false
+
+[python]
+version = "3.11.6"
