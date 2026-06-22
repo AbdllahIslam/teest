@@ -111,6 +111,29 @@ function initTheme() {
 }
 
 initTheme();
+n// Quick backend health check to help debug hosted failures. Shows model load / connectivity state.
+async function checkBackendHealth() {
+  try {
+    const res = await fetch(`${BACKEND_ORIGIN}/health`, { cache: "no-store" });
+    if (!res.ok) {
+      showStatus(`Backend health check failed: ${res.status}`);
+      return;
+    }
+    const info = await res.json();
+    if (info && info.ok && info.model_loaded) {
+      showStatus("Backend OK. Model loaded.");
+    } else if (info && info.ok) {
+      showStatus("Backend OK but model not loaded.");
+    } else {
+      showStatus("Backend unreachable or unhealthy.");
+    }
+  } catch (err) {
+    console.warn("Health check failed:", err);
+    showStatus("Could not connect to backend. Ensure server is running on the same origin or provide ?backend=URL");
+  }
+}
+
+checkBackendHealth();
 
 if (themeToggleBtn) {
   themeToggleBtn.addEventListener("click", () => {

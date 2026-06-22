@@ -19,13 +19,17 @@
   let socket;
 
   try {
-    socket = typeof io === "function" ? io(BACKEND_ORIGIN) : null;
+    // Try connecting using websocket first, then polling as fallback. Specify the path to align with server.
+    socket = typeof io === "function"
+      ? io(BACKEND_ORIGIN, { transports: ["websocket", "polling"], path: "/socket.io" })
+      : null;
   } catch (error) {
-    console.error("Socket.IO client not available:", error);
+    console.error("Socket.IO client not available or failed to initialize:", error);
     socket = null;
   }
 
   if (!socket) {
+    // Minimal no-op fallback so UI doesn't crash when Socket.IO is unreachable.
     socket = {
       id: "local-fallback",
       on: () => {},
