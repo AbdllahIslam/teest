@@ -27,5 +27,5 @@ COPY . /app/
 ENV PORT=5000
 EXPOSE 5000
 
-# Run with gunicorn + eventlet worker (socket support)
-CMD ["gunicorn", "-k", "eventlet", "-w", "1", "server:app", "--bind", "0.0.0.0:5000", "--timeout", "120"]
+# Run with gunicorn using the default sync worker
+CMD ["sh", "-c", "gunicorn server:app --workers 1 --worker-class sync --threads 4 --timeout 300 --bind 0.0.0.0:${PORT}"]
