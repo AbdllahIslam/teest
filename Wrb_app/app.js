@@ -458,8 +458,9 @@ async function leaveMeeting() {
 }
 
 function startSyncIntervals() {
-  // Sync events every 1 second (1000ms)
-  pollInterval = setInterval(pollEvents, 1000);
+  // Sync events more frequently for faster signal exchange when multiple users join
+  // This ensures ICE candidates and SDP messages are not delayed
+  pollInterval = setInterval(pollEvents, 500);
   
   // Heartbeat every 4 seconds
   heartbeatInterval = setInterval(sendHeartbeat, 4000);
@@ -535,8 +536,8 @@ function handleReceivedEvent(event) {
       addSystemMessage(`${sender_name} joined the room.`);
       // Add empty video card placeholder
       createParticipantCardPlaceholder(sender, sender_name);
-      // Initiate WebRTC connection with the new participant
-      initiatePeerConnection(sender, sender_name, true);
+      // DO NOT initiate connection - let the new joiner initiate to us
+      // This prevents race conditions in mesh networks
       break;
 
     case "leave":
@@ -567,6 +568,9 @@ function handleReceivedEvent(event) {
 // ==========================================================================
 
 function initiatePeerConnection(targetUserId, targetUserName, isOfferCreator) {
+  // Create placeholder card if it doesn't exist
+  createParticipantCardPlaceholder(targetUserId, targetUserName);
+
   // If PC already exists, close it first
   if (peerConnections[targetUserId]) {
     peerConnections[targetUserId].close();
@@ -616,9 +620,8 @@ function initiatePeerConnection(targetUserId, targetUserName, isOfferCreator) {
     console.log(`Signaling state with ${targetUserName}: ${pc.signalingState}`);
   };
 
-  // Only create offer if this user should (determined by comparing userIds - larger ID creates offer)
-  // This prevents race conditions where both sides create offers
-  if (isOfferCreator && userId > targetUserId) {
+  // Only create offer if explicitly told to (i.e., this is the new joiner)
+  if (isOfferCreator) {
     const createAndSendOffer = async () => {
       try {
         if (pc.signalingState !== "stable") {
