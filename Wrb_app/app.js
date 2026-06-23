@@ -1011,6 +1011,7 @@ function processPose(image) {
   return new Promise((resolve) => {
     poseResolveLocal = resolve;
     pose.send({ image: image }).catch(err => {
+      poseResolveLocal = null;
       console.error("Pose send error:", err);
       resolve(null);
     });
@@ -1021,6 +1022,7 @@ function processHands(image) {
   return new Promise((resolve) => {
     handsResolveLocal = resolve;
     hands.send({ image: image }).catch(err => {
+      handsResolveLocal = null;
       console.error("Hands send error:", err);
       resolve(null);
     });
@@ -1291,10 +1293,8 @@ async function frameLoop() {
     prepareProcessingFrame();
 
     // Extract landmarks
-    const [poseResults, handsResults] = await Promise.all([
-      processPose(processCanvas),
-      processHands(processCanvas)
-    ]);
+    const poseResults = await processPose(processCanvas);
+    const handsResults = await processHands(processCanvas);
 
     // Render skeleton
     drawDisplayFrame(poseResults, handsResults);
