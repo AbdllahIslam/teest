@@ -535,6 +535,8 @@ function handleReceivedEvent(event) {
       addSystemMessage(`${sender_name} joined the room.`);
       // Add empty video card placeholder
       createParticipantCardPlaceholder(sender, sender_name);
+      // Initiate WebRTC connection with the new participant
+      initiatePeerConnection(sender, sender_name, true);
       break;
 
     case "leave":
