@@ -953,8 +953,22 @@ function showDialogueBubble(targetUserId, targetUserName, word) {
 let poseResolveLocal = null;
 let handsResolveLocal = null;
 
+const MEDIAPIPE_POSE_VERSION = "0.5.1675469404";
+const MEDIAPIPE_HANDS_VERSION = "0.4.1675469240";
+
+function resolveMediapipeAsset(file, fallbackSolution) {
+  const solution = file.startsWith("hands_")
+    ? "hands"
+    : file.startsWith("pose_")
+      ? "pose"
+      : fallbackSolution;
+
+  const version = solution === "pose" ? MEDIAPIPE_POSE_VERSION : MEDIAPIPE_HANDS_VERSION;
+  return `https://cdn.jsdelivr.net/npm/@mediapipe/${solution}@${version}/${file}`;
+}
+
 const pose = new Pose({
-  locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/pose@0.5.1675469404/${file}`
+  locateFile: (file) => resolveMediapipeAsset(file, "pose")
 });
 
 pose.setOptions({
@@ -975,7 +989,7 @@ pose.onResults((results) => {
 });
 
 const hands = new Hands({
-  locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/${file}`
+  locateFile: (file) => resolveMediapipeAsset(file, "hands")
 });
 
 hands.setOptions({
