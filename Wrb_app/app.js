@@ -362,14 +362,14 @@ async function joinMeeting() {
     displayRoomId.textContent = roomId;
     roomBadge.classList.remove("hidden");
 
+    // Start local camera/mic stream
+    await startMeetingStream();
+
     // Connect WebRTC to all existing participants in the room
     data.participants.forEach(p => {
       // Joiner initiates peer connection
       initiatePeerConnection(p.id, p.name, true);
     });
-
-    // Start local camera/mic stream
-    await startMeetingStream();
 
     // Configure Button Classes
     cameraToggleBtn.classList.toggle("muted", !cameraOn);
@@ -602,15 +602,20 @@ function initiatePeerConnection(targetUserId, targetUserName, isOfferCreator) {
 
   // Negotiation handler (Only run if we are the connection initiator)
   if (isOfferCreator) {
-    pc.onnegotiationneeded = async () => {
+    const createAndSendOffer = async () => {
       try {
+        if (pc.signalingState !== "stable") return;
         const offer = await pc.createOffer();
+        if (pc.signalingState !== "stable") return;
         await pc.setLocalDescription(offer);
         sendEvent("webrtc_signal", { sdp: offer }, targetUserId);
       } catch (err) {
         console.error("Error creating WebRTC offer:", err);
       }
     };
+
+    pc.onnegotiationneeded = createAndSendOffer;
+    queueMicrotask(createAndSendOffer);
   }
 
   return pc;
