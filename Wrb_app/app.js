@@ -602,13 +602,34 @@ function initiatePeerConnection(targetUserId, targetUserName, isOfferCreator) {
     addRemoteParticipantCard(targetUserId, targetUserName, remoteStream);
   };
 
-  // Negotiation handler (Only run if we are the connection initiator)
-  if (isOfferCreator) {
+  // Connection state monitoring
+  pc.onconnectionstatechange = () => {
+    console.log(`Connection state with ${targetUserName}: ${pc.connectionState}`);
+    if (pc.connectionState === "failed") {
+      console.error(`Connection failed with ${targetUserName}, attempting restart...`);
+      removeParticipantCard(targetUserId);
+    }
+  };
+
+  // Signaling state monitoring for debugging
+  pc.onsignalingstatechange = () => {
+    console.log(`Signaling state with ${targetUserName}: ${pc.signalingState}`);
+  };
+
+  // Only create offer if this user should (determined by comparing userIds - larger ID creates offer)
+  // This prevents race conditions where both sides create offers
+  if (isOfferCreator && userId > targetUserId) {
     const createAndSendOffer = async () => {
       try {
-        if (pc.signalingState !== "stable") return;
+        if (pc.signalingState !== "stable") {
+          console.warn(`Cannot create offer - signaling state is ${pc.signalingState}, not stable`);
+          return;
+        }
         const offer = await pc.createOffer();
-        if (pc.signalingState !== "stable") return;
+        if (pc.signalingState !== "stable") {
+          console.warn(`Signaling state changed during offer creation to ${pc.signalingState}`);
+          return;
+        }
         await pc.setLocalDescription(offer);
         sendEvent("webrtc_signal", { sdp: offer }, targetUserId);
       } catch (err) {
@@ -617,7 +638,8 @@ function initiatePeerConnection(targetUserId, targetUserName, isOfferCreator) {
     };
 
     pc.onnegotiationneeded = createAndSendOffer;
-    queueMicrotask(createAndSendOffer);
+    // Use setTimeout to allow peer connection to fully initialize
+    setTimeout(createAndSendOffer, 100);
   }
 
   return pc;
@@ -632,16 +654,39 @@ async function handleWebRTCSignal(senderId, senderName, signalData) {
 
     if (sessionDesc.type === "offer") {
       // Receiver initializes peer connection passively (not the initiator)
-      pc = initiatePeerConnection(senderId, senderName, false);
-      await pc.setRemoteDescription(new RTCSessionDescription(sessionDesc));
-
-      const answer = await pc.createAnswer();
-      await pc.setLocalDescription(answer);
-      sendEvent("webrtc_signal", { sdp: answer }, senderId);
+      if (!pc) {
+        pc = initiatePeerConnection(senderId, senderName, false);
+      }
+      
+      try {
+        // Only set remote description if in correct state
+        if (pc.signalingState === "stable" || pc.signalingState === "have-local-offer") {
+          await pc.setRemoteDescription(new RTCSessionDescription(sessionDesc));
+          
+          const answer = await pc.createAnswer();
+          await pc.setLocalDescription(answer);
+          sendEvent("webrtc_signal", { sdp: answer }, senderId);
+        } else {
+          console.warn(`Cannot set remote offer - signaling state is ${pc.signalingState}`);
+        }
+      } catch (err) {
+        console.error("Error handling WebRTC offer:", err);
+      }
     } 
     else if (sessionDesc.type === "answer") {
       if (pc) {
-        await pc.setRemoteDescription(new RTCSessionDescription(sessionDesc));
+        try {
+          // Only set remote description if in correct state
+          if (pc.signalingState === "have-local-offer") {
+            await pc.setRemoteDescription(new RTCSessionDescription(sessionDesc));
+          } else {
+            console.warn(`Cannot set remote answer - signaling state is ${pc.signalingState}`);
+          }
+        } catch (err) {
+          console.error("Error handling WebRTC answer:", err);
+        }
+      } else {
+        console.warn(`Received answer from ${senderName} but no peer connection exists`);
       }
     }
   } 
@@ -649,9 +694,12 @@ async function handleWebRTCSignal(senderId, senderName, signalData) {
   else if (signalData.candidate) {
     if (pc) {
       try {
-        await pc.addIceCandidate(new RTCIceCandidate(signalData.candidate));
+        // Only add ICE candidate if connection exists and is in valid state
+        if (pc.signalingState !== "closed") {
+          await pc.addIceCandidate(new RTCIceCandidate(signalData.candidate));
+        }
       } catch (err) {
-        console.error("Error adding received ICE candidate:", err);
+        console.warn("Error adding received ICE candidate:", err);
       }
     }
   }

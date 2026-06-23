@@ -138,6 +138,15 @@ def app_js():
     return send_from_directory(".", "app.js")
 
 
+# Catch-all route for static files
+@app.route("/<path:filename>")
+def static_files(filename):
+    try:
+        return send_from_directory(".", filename)
+    except:
+        return "File not found", 404
+
+
 @app.route("/api/rooms/join", methods=["POST"])
 def join_room():
     data = request.get_json() or {}
