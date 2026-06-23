@@ -56,6 +56,8 @@ const bubbleTimers = {}; // userId -> setTimeout ID
 // Timers for polling and heartbeats
 let pollInterval = null;
 let heartbeatInterval = null;
+let pollFailureCount = 0;
+const maxPollBackoff = 5000; // 5 seconds max
 
 // ==========================================================================
 // DOM ELEMENTS
@@ -480,7 +482,7 @@ async function sendHeartbeat() {
       body: JSON.stringify({ user_id: userId })
     });
   } catch (err) {
-    console.error("Heartbeat error:", err);
+    console.warn("Heartbeat error (non-critical):", err.message);
   }
 }
 
@@ -488,7 +490,7 @@ async function sendHeartbeat() {
 async function sendEvent(eventType, eventData = {}, recipient = null) {
   if (!roomId || !userId) return;
   try {
-    await fetch(`/api/rooms/${roomId}/events`, {
+    const response = await fetch(`/api/rooms/${roomId}/events`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -498,8 +500,11 @@ async function sendEvent(eventType, eventData = {}, recipient = null) {
         recipient: recipient
       })
     });
+    if (!response.ok && response.status >= 500) {
+      console.error(`Server error (${response.status}) sending ${eventType} event`);
+    }
   } catch (err) {
-    console.error("Post event error:", err);
+    console.warn(`Network error sending ${eventType} event:`, err.message);
   }
 }
 
@@ -510,18 +515,34 @@ async function sendEvent(eventType, eventData = {}, recipient = null) {
 async function pollEvents() {
   if (!roomId || !userId) return;
   try {
-    const response = await fetch(`/api/rooms/${roomId}/events?user_id=${userId}&last_event_id=${lastEventId}`);
-    if (!response.ok) return;
+    const response = await fetch(`/api/rooms/${roomId}/events?user_id=${userId}&last_event_id=${lastEventId}`, {
+      signal: AbortSignal.timeout(5000) // 5 second timeout
+    });
+    if (!response.ok) {
+      if (response.status >= 500) {
+        console.warn(`Server error (${response.status}) polling events`);
+        pollFailureCount++;
+      }
+      return;
+    }
+
+    pollFailureCount = 0; // Reset on success
 
     const data = await response.json();
     if (data.events && data.events.length > 0) {
+      console.log(`Received ${data.events.length} events`);
       data.events.forEach(event => {
         handleReceivedEvent(event);
         lastEventId = Math.max(lastEventId, event.id);
       });
     }
   } catch (err) {
-    console.error("Polling events error:", err);
+    if (err.name === "AbortError") {
+      console.warn("Poll request timed out");
+    } else {
+      console.warn("Polling events error:", err.message);
+    }
+    pollFailureCount++;
   }
 }
 
@@ -534,12 +555,12 @@ function handleReceivedEvent(event) {
   switch (type) {
     case "join":
       addSystemMessage(`${sender_name} joined the room.`);
-      // Create placeholder card
       createParticipantCardPlaceholder(sender, sender_name);
-      // Existing participants also need to initiate connections with new users
-      // BUT use isOfferCreator=false so they receive offers, not create them
+      // Deterministic: Only the user with SMALLER ID creates the offer
+      // This prevents both sides from creating offers simultaneously
       if (!peerConnections[sender]) {
-        initiatePeerConnection(sender, sender_name, false);
+        const shouldCreateOffer = userId < sender; // Smaller ID creates offer
+        initiatePeerConnection(sender, sender_name, shouldCreateOffer);
       }
       break;
 
@@ -593,13 +614,21 @@ function initiatePeerConnection(targetUserId, targetUserName, isOfferCreator) {
 
   const pc = new RTCPeerConnection({
     iceServers: [
+      // Multiple STUN servers for better connectivity
       { urls: "stun:stun.l.google.com:19302" },
       { urls: "stun:stun1.l.google.com:19302" },
-      { urls: "stun:stun2.l.google.com:19302" }
-    ]
+      { urls: "stun:stun2.l.google.com:19302" },
+      { urls: "stun:stun3.l.google.com:19302" },
+      { urls: "stun:stun4.l.google.com:19302" },
+      { urls: "stun:stun.stunprotocol.org:3478" }
+    ],
+    bundlePolicy: "max-bundle",
+    rtcpMuxPolicy: "require"
   });
 
   peerConnections[targetUserId] = pc;
+  let connectionAttempts = 0;
+  const maxConnectionAttempts = 3;
 
   // Add our local tracks to the connection
   if (localStream) {
@@ -611,31 +640,53 @@ function initiatePeerConnection(targetUserId, targetUserName, isOfferCreator) {
   // ICE candidates callback
   pc.onicecandidate = (e) => {
     if (e.candidate) {
+      console.log(`ICE candidate from ${targetUserName}:`, e.candidate.candidate.substring(0, 50));
       sendEvent("webrtc_signal", { candidate: e.candidate }, targetUserId);
+    } else {
+      console.log(`ICE gathering complete for ${targetUserName}`);
     }
   };
 
   // Remote track received callback
   pc.ontrack = (e) => {
+    console.log(`Received remote track from ${targetUserName}:`, e.track.kind);
     const remoteStream = e.streams[0];
     addRemoteParticipantCard(targetUserId, targetUserName, remoteStream);
   };
 
-  // Connection state monitoring
+  // Connection state monitoring with recovery
   pc.onconnectionstatechange = () => {
-    console.log(`Connection state with ${targetUserName}: ${pc.connectionState}`);
-    if (pc.connectionState === "failed" || pc.connectionState === "disconnected") {
-      console.error(`Connection failed/disconnected with ${targetUserName}`);
-      // Don't auto-remove on disconnect - user might reconnect
+    const state = pc.connectionState;
+    console.log(`Connection state with ${targetUserName}: ${state}`);
+    
+    if (state === "failed") {
+      connectionAttempts++;
+      console.warn(`Connection failed with ${targetUserName} (attempt ${connectionAttempts}/${maxConnectionAttempts})`);
+      
+      // Try to recover by restarting ICE
+      if (connectionAttempts < maxConnectionAttempts) {
+        console.log(`Attempting to restart ICE with ${targetUserName}...`);
+        pc.restartIce();
+      } else {
+        console.error(`Failed to connect with ${targetUserName} after ${maxConnectionAttempts} attempts`);
+      }
+    } else if (state === "connected") {
+      console.log(`✓ Successfully connected with ${targetUserName}`);
+      connectionAttempts = 0;
     }
   };
 
-  // Signaling state monitoring for debugging
+  // ICE connection state monitoring
+  pc.oniceconnectionstatechange = () => {
+    console.log(`ICE connection state with ${targetUserName}: ${pc.iceConnectionState}`);
+  };
+
+  // Signaling state monitoring
   pc.onsignalingstatechange = () => {
     console.log(`Signaling state with ${targetUserName}: ${pc.signalingState}`);
   };
 
-  // Only create offer if explicitly told to (i.e., this is the new joiner)
+  // Only create offer if explicitly told to (i.e., this is the new joiner or has smaller ID)
   if (isOfferCreator) {
     const createAndSendOffer = async () => {
       try {
@@ -643,7 +694,11 @@ function initiatePeerConnection(targetUserId, targetUserName, isOfferCreator) {
           console.warn(`Cannot create offer - signaling state is ${pc.signalingState}, not stable`);
           return;
         }
-        const offer = await pc.createOffer();
+        console.log(`Creating offer for ${targetUserName}`);
+        const offer = await pc.createOffer({
+          offerToReceiveAudio: true,
+          offerToReceiveVideo: true
+        });
         if (pc.signalingState !== "stable") {
           console.warn(`Signaling state changed during offer creation to ${pc.signalingState}`);
           return;
@@ -752,6 +807,7 @@ function createParticipantCardPlaceholder(targetUserId, targetUserName) {
     const video = document.createElement("video");
     video.autoplay = true;
     video.playsInline = true;
+    video.muted = false; // Allow audio from remote participants
 
     const info = document.createElement("div");
     info.className = "video-info";
@@ -788,19 +844,39 @@ function addRemoteParticipantCard(targetUserId, targetUserName, stream) {
   createParticipantCardPlaceholder(targetUserId, targetUserName);
   
   const card = document.getElementById(`video-card-${targetUserId}`);
-  if (card) {
-    const video = card.querySelector("video");
-    if (video && video.srcObject !== stream) {
-      video.srcObject = stream;
-      // Catch play errors gracefully - video element might be removed during play
+  if (!card) {
+    console.warn(`Card not found for ${targetUserName} after creating placeholder`);
+    return;
+  }
+  
+  const video = card.querySelector("video");
+  if (!video) {
+    console.warn(`Video element not found in card for ${targetUserName}`);
+    return;
+  }
+  
+  if (video.srcObject !== stream) {
+    console.log(`Setting video stream for ${targetUserName}`);
+    video.srcObject = stream;
+    
+    // Try to play - ignore errors if element is removed
+    try {
       const playPromise = video.play();
       if (playPromise !== undefined) {
         playPromise.catch(err => {
-          console.warn(`Could not play video for ${targetUserName}:`, err.message);
+          // Only log if it's not an "interrupted" error (expected)
+          if (!err.message.includes("interrupted")) {
+            console.warn(`Could not play video for ${targetUserName}:`, err.message);
+          }
         });
       }
+    } catch (err) {
+      console.warn(`Error playing video for ${targetUserName}:`, err.message);
     }
-    // Remove camera off placeholder status once stream is rendering
+  }
+  
+  // Remove camera off placeholder status once stream is being set
+  if (stream && stream.getTracks().length > 0) {
     card.classList.remove("camera-off");
   }
 }
