@@ -15,7 +15,7 @@ const MINIMUM_PREDICTION_MARGIN = 0.10;
 const REQUIRED_STABLE_PREDICTIONS = 3;
 const PREDICTION_QUEUE_SIZE = 5;
 const WORD_REPEAT_DELAY_MS = 1800;
-const PREDICTION_INTERVAL_MS = 450;
+const PREDICTION_INTERVAL_MS = 250;
 
 // App navigation state
 let currentScreen = "lobby"; // "lobby" or "meeting"
@@ -1277,8 +1277,10 @@ async function frameLoop() {
     prepareProcessingFrame();
 
     // Extract landmarks
-    const poseResults = await processPose(processCanvas);
-    const handsResults = await processHands(processCanvas);
+    const [poseResults, handsResults] = await Promise.all([
+      processPose(processCanvas),
+      processHands(processCanvas)
+    ]);
 
     // Render skeleton
     drawDisplayFrame(poseResults, handsResults);
@@ -1304,7 +1306,7 @@ async function frameLoop() {
             updateStatusIndicator(`Buffering: ${sequence.length}/${SEQUENCE_LENGTH}`);
           } else {
             updateStatusIndicator("Translating signs...");
-            await sendPrediction();
+            void sendPrediction();
           }
         }
       }
