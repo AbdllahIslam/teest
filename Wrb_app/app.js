@@ -49,6 +49,7 @@ let pendingPrediction = { word: "", count: 0 };
 
 // Peer connections (WebRTC Mesh)
 const peerConnections = {}; // targetUserId -> RTCPeerConnection
+const pendingOffers = {}; // targetUserId -> true (tracks who we sent offers to)
 
 // Speech bubble timers
 const bubbleTimers = {}; // userId -> setTimeout ID
@@ -705,6 +706,7 @@ function initiatePeerConnection(targetUserId, targetUserName, isOfferCreator) {
         }
         await pc.setLocalDescription(offer);
         console.log(`Sending offer to ${targetUserName}`);
+        pendingOffers[targetUserId] = true; // Track that we sent an offer
         sendEvent("webrtc_signal", { sdp: offer }, targetUserId);
       } catch (err) {
         console.error("Error creating WebRTC offer:", err);
@@ -753,12 +755,16 @@ async function handleWebRTCSignal(senderId, senderName, signalData) {
     else if (sessionDesc.type === "answer") {
       if (pc) {
         try {
-          // Only set remote description if in correct state
-          if (pc.signalingState === "have-local-offer") {
+          // Try to set answer if we sent an offer (check pending offers or state)
+          const hasPendingOffer = pendingOffers[senderId];
+          const isValidAnswerState = pc.signalingState === "have-local-offer";
+           
+          if (hasPendingOffer || isValidAnswerState) {
             console.log(`Setting remote answer from ${senderName}`);
             await pc.setRemoteDescription(new RTCSessionDescription(sessionDesc));
+            delete pendingOffers[senderId]; // Clear pending offer
           } else {
-            console.warn(`Cannot set remote answer from ${senderName} - signaling state is ${pc.signalingState}`);
+            console.warn(`Cannot set remote answer from ${senderName} - signaling state is ${pc.signalingState}, no pending offer`);
           }
         } catch (err) {
           console.error(`Error handling WebRTC answer from ${senderName}:`, err);
@@ -906,6 +912,9 @@ function removeParticipantCard(targetUserId) {
     }
     delete peerConnections[targetUserId];
   }
+
+  // Clean up pending offer tracking
+  delete pendingOffers[targetUserId];
 
   if (bubbleTimers[targetUserId]) {
     clearTimeout(bubbleTimers[targetUserId]);
