@@ -195,9 +195,15 @@ def join_room():
         if pid != user_id
     ]
     
+    # Assign coordinator role: oldest participant should be the one to receive offers
+    # (This ensures only ONE side creates offers, preventing race conditions)
+    participant_ids = sorted([pid for pid in ROOMS[room_id]["participants"].keys()])
+    coordinator_id = participant_ids[0] if participant_ids else None
+    
     return jsonify({
         "user_id": user_id,
-        "participants": other_participants
+        "participants": other_participants,
+        "coordinator_id": coordinator_id
     })
 
 

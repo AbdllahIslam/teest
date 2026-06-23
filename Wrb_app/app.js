@@ -366,8 +366,8 @@ async function joinMeeting() {
     await startMeetingStream();
 
     // Connect WebRTC to all existing participants in the room
+    // NEW JOINER is responsible for creating offers to existing participants
     data.participants.forEach(p => {
-      // Joiner initiates peer connection
       initiatePeerConnection(p.id, p.name, true);
     });
 
@@ -534,10 +534,13 @@ function handleReceivedEvent(event) {
   switch (type) {
     case "join":
       addSystemMessage(`${sender_name} joined the room.`);
-      // Add empty video card placeholder
+      // Create placeholder card
       createParticipantCardPlaceholder(sender, sender_name);
-      // DO NOT initiate connection - let the new joiner initiate to us
-      // This prevents race conditions in mesh networks
+      // Existing participants also need to initiate connections with new users
+      // BUT use isOfferCreator=false so they receive offers, not create them
+      if (!peerConnections[sender]) {
+        initiatePeerConnection(sender, sender_name, false);
+      }
       break;
 
     case "leave":
@@ -568,13 +571,25 @@ function handleReceivedEvent(event) {
 // ==========================================================================
 
 function initiatePeerConnection(targetUserId, targetUserName, isOfferCreator) {
+  // If PC already exists, don't recreate it - just ensure it has tracks
+  if (peerConnections[targetUserId]) {
+    console.log(`Peer connection already exists with ${targetUserName}`);
+    // Ensure local tracks are added
+    if (localStream) {
+      localStream.getTracks().forEach(track => {
+        const sender = peerConnections[targetUserId]
+          .getSenders()
+          .find(s => s.track && s.track.kind === track.kind);
+        if (!sender) {
+          peerConnections[targetUserId].addTrack(track, localStream);
+        }
+      });
+    }
+    return peerConnections[targetUserId];
+  }
+
   // Create placeholder card if it doesn't exist
   createParticipantCardPlaceholder(targetUserId, targetUserName);
-
-  // If PC already exists, close it first
-  if (peerConnections[targetUserId]) {
-    peerConnections[targetUserId].close();
-  }
 
   const pc = new RTCPeerConnection({
     iceServers: [
@@ -609,9 +624,9 @@ function initiatePeerConnection(targetUserId, targetUserName, isOfferCreator) {
   // Connection state monitoring
   pc.onconnectionstatechange = () => {
     console.log(`Connection state with ${targetUserName}: ${pc.connectionState}`);
-    if (pc.connectionState === "failed") {
-      console.error(`Connection failed with ${targetUserName}, attempting restart...`);
-      removeParticipantCard(targetUserId);
+    if (pc.connectionState === "failed" || pc.connectionState === "disconnected") {
+      console.error(`Connection failed/disconnected with ${targetUserName}`);
+      // Don't auto-remove on disconnect - user might reconnect
     }
   };
 
@@ -634,6 +649,7 @@ function initiatePeerConnection(targetUserId, targetUserName, isOfferCreator) {
           return;
         }
         await pc.setLocalDescription(offer);
+        console.log(`Sending offer to ${targetUserName}`);
         sendEvent("webrtc_signal", { sdp: offer }, targetUserId);
       } catch (err) {
         console.error("Error creating WebRTC offer:", err);
@@ -658,22 +674,25 @@ async function handleWebRTCSignal(senderId, senderName, signalData) {
     if (sessionDesc.type === "offer") {
       // Receiver initializes peer connection passively (not the initiator)
       if (!pc) {
+        console.log(`Creating peer connection to receive offer from ${senderName}`);
         pc = initiatePeerConnection(senderId, senderName, false);
       }
       
       try {
         // Only set remote description if in correct state
         if (pc.signalingState === "stable" || pc.signalingState === "have-local-offer") {
+          console.log(`Setting remote offer from ${senderName}`);
           await pc.setRemoteDescription(new RTCSessionDescription(sessionDesc));
           
           const answer = await pc.createAnswer();
           await pc.setLocalDescription(answer);
+          console.log(`Sending answer to ${senderName}`);
           sendEvent("webrtc_signal", { sdp: answer }, senderId);
         } else {
-          console.warn(`Cannot set remote offer - signaling state is ${pc.signalingState}`);
+          console.warn(`Cannot set remote offer from ${senderName} - signaling state is ${pc.signalingState}`);
         }
       } catch (err) {
-        console.error("Error handling WebRTC offer:", err);
+        console.error(`Error handling WebRTC offer from ${senderName}:`, err);
       }
     } 
     else if (sessionDesc.type === "answer") {
@@ -681,12 +700,13 @@ async function handleWebRTCSignal(senderId, senderName, signalData) {
         try {
           // Only set remote description if in correct state
           if (pc.signalingState === "have-local-offer") {
+            console.log(`Setting remote answer from ${senderName}`);
             await pc.setRemoteDescription(new RTCSessionDescription(sessionDesc));
           } else {
-            console.warn(`Cannot set remote answer - signaling state is ${pc.signalingState}`);
+            console.warn(`Cannot set remote answer from ${senderName} - signaling state is ${pc.signalingState}`);
           }
         } catch (err) {
-          console.error("Error handling WebRTC answer:", err);
+          console.error(`Error handling WebRTC answer from ${senderName}:`, err);
         }
       } else {
         console.warn(`Received answer from ${senderName} but no peer connection exists`);
@@ -702,8 +722,13 @@ async function handleWebRTCSignal(senderId, senderName, signalData) {
           await pc.addIceCandidate(new RTCIceCandidate(signalData.candidate));
         }
       } catch (err) {
-        console.warn("Error adding received ICE candidate:", err);
+        // Silently ignore duplicate ICE candidates
+        if (!err.message.includes("duplicate")) {
+          console.warn(`Error adding ICE candidate from ${senderName}:`, err.message);
+        }
       }
+    } else {
+      console.warn(`Received ICE candidate from ${senderName} but no peer connection exists`);
     }
   }
 }
@@ -767,7 +792,13 @@ function addRemoteParticipantCard(targetUserId, targetUserName, stream) {
     const video = card.querySelector("video");
     if (video && video.srcObject !== stream) {
       video.srcObject = stream;
-      video.play();
+      // Catch play errors gracefully - video element might be removed during play
+      const playPromise = video.play();
+      if (playPromise !== undefined) {
+        playPromise.catch(err => {
+          console.warn(`Could not play video for ${targetUserName}:`, err.message);
+        });
+      }
     }
     // Remove camera off placeholder status once stream is rendering
     card.classList.remove("camera-off");
@@ -777,11 +808,26 @@ function addRemoteParticipantCard(targetUserId, targetUserName, stream) {
 function removeParticipantCard(targetUserId) {
   const card = document.getElementById(`video-card-${targetUserId}`);
   if (card) {
-    card.remove();
+    // Stop video playback before removing
+    const video = card.querySelector("video");
+    if (video) {
+      video.srcObject = null;
+      video.pause();
+    }
+    // Remove after a short delay to ensure clean removal
+    setTimeout(() => {
+      if (card && card.parentNode) {
+        card.remove();
+      }
+    }, 100);
   }
 
   if (peerConnections[targetUserId]) {
-    peerConnections[targetUserId].close();
+    try {
+      peerConnections[targetUserId].close();
+    } catch (err) {
+      console.warn(`Error closing peer connection with ${targetUserId}:`, err);
+    }
     delete peerConnections[targetUserId];
   }
 
