@@ -954,7 +954,7 @@ let poseResolveLocal = null;
 let handsResolveLocal = null;
 
 const pose = new Pose({
-  locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/pose/${file}`
+  locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/pose@0.5.1675469404/${file}`
 });
 
 pose.setOptions({
@@ -975,7 +975,7 @@ pose.onResults((results) => {
 });
 
 const hands = new Hands({
-  locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`
+  locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/${file}`
 });
 
 hands.setOptions({
@@ -1106,7 +1106,11 @@ function drawHandBox(handLandmarks) {
   // Draw rounded card borders
   canvasCtx.beginPath();
   const radius = 10;
-  canvasCtx.roundRect(x1, y1, x2 - x1, y2 - y1, radius);
+  if (typeof canvasCtx.roundRect === "function") {
+    canvasCtx.roundRect(x1, y1, x2 - x1, y2 - y1, radius);
+  } else {
+    canvasCtx.rect(x1, y1, x2 - x1, y2 - y1);
+  }
   canvasCtx.stroke();
   canvasCtx.restore();
 }
