@@ -605,6 +605,7 @@ function handleServerDead(statusMessage) {
     delete peerConnections[pid];
   });
   Object.keys(iceCandidateBuffers).forEach(pid => { delete iceCandidateBuffers[pid]; });
+  Object.keys(lastProcessedOfferSdp).forEach(pid => { delete lastProcessedOfferSdp[pid]; });
 
   // Remove stale remote video cards
   if (videoGrid) videoGrid.querySelectorAll(".video-card.remote").forEach(c => c.remove());
@@ -662,6 +663,7 @@ function scheduleReconnect() {
         delete peerConnections[pid];
       });
       Object.keys(iceCandidateBuffers).forEach(pid => { delete iceCandidateBuffers[pid]; });
+  Object.keys(lastProcessedOfferSdp).forEach(pid => { delete lastProcessedOfferSdp[pid]; });
       Object.keys(pendingOffers).forEach(pid => { delete pendingOffers[pid]; });
 
       // Remove stale remote video cards
@@ -727,6 +729,9 @@ function handleReceivedEvent(event) {
 
 // Per-peer ICE candidate buffer: holds candidates that arrive before remote description is set
 const iceCandidateBuffers = {}; // targetUserId -> RTCIceCandidate[]
+// Tracks the SDP fingerprint of the last offer we processed per peer.
+// Identical back-to-back offers from the event queue are silently ignored.
+const lastProcessedOfferSdp = {}; // targetUserId -> sdp string
 
 function initiatePeerConnection(targetUserId, targetUserName, isOfferCreator) {
   // If PC already exists, don't recreate it - just ensure it has tracks
@@ -891,77 +896,97 @@ async function drainIceCandidateBuffer(targetUserId) {
 async function handleWebRTCSignal(senderId, senderName, signalData) {
   let pc = peerConnections[senderId];
 
-  // Receive Session SDP Offer or Answer
+  // ── SDP (offer / answer) ──────────────────────────────────────────────────
   if (signalData.sdp) {
     const sessionDesc = signalData.sdp;
 
+    // ── OFFER ──────────────────────────────────────────────────────────────
     if (sessionDesc.type === "offer") {
-      // Receiver initializes peer connection passively (not the initiator)
+
+      // Deduplicate: if we already processed this exact SDP, skip it.
+      // The HTTP event queue re-delivers old signals on every poll until the
+      // server clears them, causing the "Setting remote offer" storm in logs.
+      const offerKey = sessionDesc.sdp ? sessionDesc.sdp.slice(0, 120) : "";
+      if (lastProcessedOfferSdp[senderId] === offerKey) {
+        return; // exact duplicate – already answered this offer
+      }
+
+      // Create peer connection if this is the first contact from this peer
       if (!pc) {
-        console.log(`Creating peer connection to receive offer from ${senderName}`);
         pc = initiatePeerConnection(senderId, senderName, false);
       }
 
       try {
-        // Handle "glare" (both sides sent an offer simultaneously):
-        // Roll back our local offer so we can accept the remote one.
+        // GLARE: both sides sent an offer at the same time.
+        // Roll back ours so we can accept the remote one.
         if (pc.signalingState === "have-local-offer") {
-          console.log(`Glare detected with ${senderName} – rolling back local offer`);
+          console.log(`Glare with ${senderName} – rolling back our offer`);
           await pc.setLocalDescription({ type: "rollback" });
+          // After rollback, signalingState is "stable" – fall through below
         }
 
-        if (pc.signalingState === "stable") {
-          console.log(`Setting remote offer from ${senderName}`);
-          await pc.setRemoteDescription(new RTCSessionDescription(sessionDesc));
-
-          // Drain any ICE candidates that arrived before the remote description
-          await drainIceCandidateBuffer(senderId);
-
-          const answer = await pc.createAnswer();
-          await pc.setLocalDescription(answer);
-          console.log(`Sending answer to ${senderName}`);
-          sendEvent("webrtc_signal", { sdp: pc.localDescription }, senderId);
-        } else {
-          console.warn(`Cannot handle offer from ${senderName} – unexpected signaling state: ${pc.signalingState}`);
+        if (pc.signalingState === "have-remote-offer") {
+          // We're already processing an offer from this peer (async race).
+          // The currently-in-flight handling will finish; ignore this duplicate.
+          console.log(`Already processing offer from ${senderName} – skipping duplicate`);
+          return;
         }
+
+        if (pc.signalingState !== "stable") {
+          console.warn(`Cannot accept offer from ${senderName} in state ${pc.signalingState}`);
+          return;
+        }
+
+        // Mark this offer as being processed BEFORE any await so a second
+        // concurrent call (same offer, next poll tick) exits early above.
+        lastProcessedOfferSdp[senderId] = offerKey;
+
+        console.log(`Setting remote offer from ${senderName}`);
+        await pc.setRemoteDescription(new RTCSessionDescription(sessionDesc));
+
+        // Drain candidates that arrived before the remote description was set
+        await drainIceCandidateBuffer(senderId);
+
+        const answer = await pc.createAnswer();
+        await pc.setLocalDescription(answer);
+        console.log(`Sending answer to ${senderName}`);
+        sendEvent("webrtc_signal", { sdp: pc.localDescription }, senderId);
+
       } catch (err) {
-        console.error(`Error handling WebRTC offer from ${senderName}:`, err);
+        // On error, clear the dedup key so we can retry on the next offer
+        delete lastProcessedOfferSdp[senderId];
+        console.error(`Error handling offer from ${senderName}:`, err.message);
       }
     }
-    else if (sessionDesc.type === "answer") {
-      if (pc) {
-        try {
-          if (pc.signalingState === "have-local-offer") {
-            console.log(`Setting remote answer from ${senderName}`);
-            await pc.setRemoteDescription(new RTCSessionDescription(sessionDesc));
-            delete pendingOffers[senderId];
 
-            // Drain buffered ICE candidates now that remote description is set
-            await drainIceCandidateBuffer(senderId);
-          } else if (pc.signalingState === "stable") {
-            // Already negotiated – this is a replayed stale answer, safely ignore
-            console.log(`Ignoring stale answer from ${senderName} (already stable)`);
-          } else {
-            console.warn(`Cannot set remote answer from ${senderName} – signaling state is ${pc.signalingState}`);
-          }
+    // ── ANSWER ─────────────────────────────────────────────────────────────
+    else if (sessionDesc.type === "answer") {
+      if (!pc) {
+        console.warn(`Answer from ${senderName} but no peer connection – ignoring`);
+        return;
+      }
+      if (pc.signalingState === "have-local-offer") {
+        try {
+          console.log(`Setting remote answer from ${senderName}`);
+          await pc.setRemoteDescription(new RTCSessionDescription(sessionDesc));
+          delete pendingOffers[senderId];
+          await drainIceCandidateBuffer(senderId);
         } catch (err) {
-          console.error(`Error handling WebRTC answer from ${senderName}:`, err);
+          console.error(`Error handling answer from ${senderName}:`, err.message);
         }
       } else {
-        console.warn(`Received answer from ${senderName} but no peer connection exists`);
+        // stable = already applied; anything else = stale replay – both are safe to drop
+        console.log(`Ignoring answer from ${senderName} in state ${pc.signalingState}`);
       }
     }
   }
-  // Receive ICE Candidate
-  else if (signalData.candidate) {
-    if (!pc) {
-      console.warn(`Received ICE candidate from ${senderName} but no peer connection exists – discarding`);
-      return;
-    }
 
-    // If remote description is not yet set, buffer the candidate
+  // ── ICE CANDIDATE ─────────────────────────────────────────────────────────
+  else if (signalData.candidate) {
+    if (!pc) return; // no connection yet – discard
+
     if (!pc.remoteDescription || !pc.remoteDescription.type) {
-      console.log(`Buffering ICE candidate from ${senderName} (remote description not set yet)`);
+      // Buffer until setRemoteDescription has been called
       if (!iceCandidateBuffers[senderId]) iceCandidateBuffers[senderId] = [];
       iceCandidateBuffers[senderId].push(new RTCIceCandidate(signalData.candidate));
       return;
@@ -973,7 +998,7 @@ async function handleWebRTCSignal(senderId, senderName, signalData) {
       }
     } catch (err) {
       if (!err.message.includes("duplicate")) {
-        console.warn(`Error adding ICE candidate from ${senderName}:`, err.message);
+        console.warn(`ICE candidate error from ${senderName}:`, err.message);
       }
     }
   }
@@ -1098,8 +1123,9 @@ function removeParticipantCard(targetUserId) {
     delete peerConnections[targetUserId];
   }
 
-  // Clean up ICE buffer
+  // Clean up ICE buffer and SDP dedup
   delete iceCandidateBuffers[targetUserId];
+  delete lastProcessedOfferSdp[targetUserId];
 
   // Clean up pending offer tracking
   delete pendingOffers[targetUserId];
