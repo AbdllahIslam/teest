@@ -378,6 +378,7 @@ async function joinMeeting() {
 
     // Connect WebRTC to all existing participants in the room
     // NEW JOINER is responsible for creating offers to existing participants
+    // async: fire-and-forget is fine here; errors are handled inside initiatePeerConnection
     data.participants.forEach(p => {
       initiatePeerConnection(p.id, p.name, true);
     });
@@ -705,7 +706,7 @@ function scheduleReconnect() {
       // Re-offer to all current participants, then restart the poll loop
       if (Array.isArray(data.participants)) {
         data.participants.forEach(p => {
-          if (p.id !== userId) initiatePeerConnection(p.id, p.name, true);
+          if (p.id !== userId) initiatePeerConnection(p.id, p.name, true); // async, fire-and-forget
         });
       }
 
@@ -930,7 +931,7 @@ async function initiatePeerConnection(targetUserId, targetUserName, isOfferCreat
         // Small delay so both sides settle before re-negotiating
         setTimeout(() => {
           if (peerConnections[targetUserId]) return; // already recreated by remote offer
-          initiatePeerConnection(targetUserId, targetUserName, isOfferCreator);
+          initiatePeerConnection(targetUserId, targetUserName, isOfferCreator); // async, fire-and-forget inside setTimeout
         }, 800 * attempts);
       } else {
         console.error(`Giving up on ${targetUserName} after ${maxAttempts} attempts`);
@@ -1037,7 +1038,7 @@ async function handleWebRTCSignal(senderId, senderName, signalData) {
 
       // Create peer connection if this is the first contact from this peer
       if (!pc) {
-        pc = initiatePeerConnection(senderId, senderName, false);
+        pc = await initiatePeerConnection(senderId, senderName, false);
       }
 
       try {
