@@ -50,6 +50,7 @@ let pendingPrediction = { word: "", count: 0 };
 // Peer connections (WebRTC Mesh)
 const peerConnections = {}; // targetUserId -> RTCPeerConnection
 const pendingOffers = {}; // targetUserId -> true (tracks who we sent offers to)
+const pendingIceCandidates = {}; // targetUserId -> RTCIceCandidate[] (queued before PC is ready)
 
 // Speech bubble timers
 const bubbleTimers = {}; // userId -> setTimeout ID
@@ -368,10 +369,13 @@ async function joinMeeting() {
     // Start local camera/mic stream
     await startMeetingStream();
 
-    // Connect WebRTC to all existing participants in the room
-    // NEW JOINER is responsible for creating offers to existing participants
+    // Connect WebRTC to all existing participants in the room.
+    // Use deterministic offer logic: the peer with the SMALLER user ID creates
+    // the offer. This prevents both sides from creating offers simultaneously
+    // when the new joiner's join event is processed by existing participants.
     data.participants.forEach(p => {
-      initiatePeerConnection(p.id, p.name, true);
+      const shouldCreateOffer = userId < p.id;
+      initiatePeerConnection(p.id, p.name, shouldCreateOffer);
     });
 
     // Configure Button Classes
@@ -439,7 +443,9 @@ async function leaveMeeting() {
   userId = "";
   username = "";
   lastEventId = 0;
-  peerConnections;
+  // Clear pending ICE candidate queues
+  Object.keys(pendingIceCandidates).forEach(k => delete pendingIceCandidates[k]);
+  Object.keys(pendingOffers).forEach(k => delete pendingOffers[k]);
   sequence = [];
   predictionQueue = [];
 
@@ -515,6 +521,16 @@ async function sendEvent(eventType, eventData = {}, recipient = null) {
 
 async function pollEvents() {
   if (!roomId || !userId) return;
+
+  // Exponential backoff: skip this poll tick if we are in a back-off window.
+  // pollFailureCount drives the delay: 0→immediate, 1→1s, 2→2s … up to maxPollBackoff.
+  if (pollFailureCount > 0) {
+    const backoffMs = Math.min(1000 * pollFailureCount, maxPollBackoff);
+    if (!pollEvents._nextAllowedAt) pollEvents._nextAllowedAt = 0;
+    if (Date.now() < pollEvents._nextAllowedAt) return;
+    pollEvents._nextAllowedAt = Date.now() + backoffMs;
+  }
+
   try {
     const response = await fetch(`/api/rooms/${roomId}/events?user_id=${userId}&last_event_id=${lastEventId}`, {
       signal: AbortSignal.timeout(5000) // 5 second timeout
@@ -523,19 +539,23 @@ async function pollEvents() {
       if (response.status >= 500) {
         console.warn(`Server error (${response.status}) polling events`);
         pollFailureCount++;
+        pollEvents._nextAllowedAt = Date.now() + Math.min(1000 * pollFailureCount, maxPollBackoff);
       }
       return;
     }
 
     pollFailureCount = 0; // Reset on success
+    pollEvents._nextAllowedAt = 0;
 
     const data = await response.json();
     if (data.events && data.events.length > 0) {
       console.log(`Received ${data.events.length} events`);
-      data.events.forEach(event => {
-        handleReceivedEvent(event);
+      // Process events sequentially so WebRTC signals (offer → answer → ICE)
+      // are handled in order and async handlers complete before the next one starts.
+      for (const event of data.events) {
+        await handleReceivedEvent(event);
         lastEventId = Math.max(lastEventId, event.id);
-      });
+      }
     }
   } catch (err) {
     if (err.name === "AbortError") {
@@ -544,10 +564,11 @@ async function pollEvents() {
       console.warn("Polling events error:", err.message);
     }
     pollFailureCount++;
+    pollEvents._nextAllowedAt = Date.now() + Math.min(1000 * pollFailureCount, maxPollBackoff);
   }
 }
 
-function handleReceivedEvent(event) {
+async function handleReceivedEvent(event) {
   const { type, sender, sender_name, data } = event;
 
   // Don't process our own broadcasted events unless they are targeted reflections
@@ -557,8 +578,9 @@ function handleReceivedEvent(event) {
     case "join":
       addSystemMessage(`${sender_name} joined the room.`);
       createParticipantCardPlaceholder(sender, sender_name);
-      // Deterministic: Only the user with SMALLER ID creates the offer
-      // This prevents both sides from creating offers simultaneously
+      // Deterministic: Only the user with SMALLER ID creates the offer.
+      // This prevents both sides from creating offers simultaneously when
+      // the new joiner's join event is seen by existing participants.
       if (!peerConnections[sender]) {
         const shouldCreateOffer = userId < sender; // Smaller ID creates offer
         initiatePeerConnection(sender, sender_name, shouldCreateOffer);
@@ -583,7 +605,8 @@ function handleReceivedEvent(event) {
       break;
 
     case "webrtc_signal":
-      handleWebRTCSignal(sender, sender_name, data);
+      // Await so that offer → answer → ICE candidates are processed in order.
+      await handleWebRTCSignal(sender, sender_name, data);
       break;
   }
 }
@@ -687,12 +710,16 @@ function initiatePeerConnection(targetUserId, targetUserName, isOfferCreator) {
     console.log(`Signaling state with ${targetUserName}: ${pc.signalingState}`);
   };
 
-  // Only create offer if explicitly told to (i.e., this is the new joiner or has smaller ID)
+  // Only create offer if explicitly told to (i.e., this peer has the smaller user ID).
+  // We deliberately do NOT use onnegotiationneeded here — it can fire multiple times
+  // and race with the explicit offer we send below, causing duplicate/conflicting offers.
   if (isOfferCreator) {
-    const createAndSendOffer = async () => {
+    // Small delay to let the PC fully initialize and local tracks to be added
+    // before we read signalingState and create the offer.
+    setTimeout(async () => {
       try {
         if (pc.signalingState !== "stable") {
-          console.warn(`Cannot create offer - signaling state is ${pc.signalingState}, not stable`);
+          console.warn(`Cannot create offer for ${targetUserName} - signaling state is ${pc.signalingState}`);
           return;
         }
         console.log(`Creating offer for ${targetUserName}`);
@@ -700,8 +727,9 @@ function initiatePeerConnection(targetUserId, targetUserName, isOfferCreator) {
           offerToReceiveAudio: true,
           offerToReceiveVideo: true
         });
+        // Re-check state after the async createOffer call completes
         if (pc.signalingState !== "stable") {
-          console.warn(`Signaling state changed during offer creation to ${pc.signalingState}`);
+          console.warn(`Signaling state changed during offer creation for ${targetUserName}: ${pc.signalingState}`);
           return;
         }
         await pc.setLocalDescription(offer);
@@ -709,13 +737,9 @@ function initiatePeerConnection(targetUserId, targetUserName, isOfferCreator) {
         pendingOffers[targetUserId] = true; // Track that we sent an offer
         sendEvent("webrtc_signal", { sdp: offer }, targetUserId);
       } catch (err) {
-        console.error("Error creating WebRTC offer:", err);
+        console.error(`Error creating WebRTC offer for ${targetUserName}:`, err);
       }
-    };
-
-    pc.onnegotiationneeded = createAndSendOffer;
-    // Use setTimeout to allow peer connection to fully initialize
-    setTimeout(createAndSendOffer, 100);
+    }, 150);
   }
 
   return pc;
@@ -729,67 +753,97 @@ async function handleWebRTCSignal(senderId, senderName, signalData) {
     const sessionDesc = signalData.sdp;
 
     if (sessionDesc.type === "offer") {
-      // Receiver initializes peer connection passively (not the initiator)
+      // Receiver initializes peer connection passively (not the offer creator)
       if (!pc) {
         console.log(`Creating peer connection to receive offer from ${senderName}`);
         pc = initiatePeerConnection(senderId, senderName, false);
       }
-      
+
       try {
-        // Only set remote description if in correct state
-        if (pc.signalingState === "stable" || pc.signalingState === "have-local-offer") {
-          console.log(`Setting remote offer from ${senderName}`);
-          await pc.setRemoteDescription(new RTCSessionDescription(sessionDesc));
-          
-          const answer = await pc.createAnswer();
-          await pc.setLocalDescription(answer);
-          console.log(`Sending answer to ${senderName}`);
-          sendEvent("webrtc_signal", { sdp: answer }, senderId);
-        } else {
-          console.warn(`Cannot set remote offer from ${senderName} - signaling state is ${pc.signalingState}`);
+        // Only accept an offer when in "stable" state. Accepting an offer while
+        // in "have-local-offer" would cause signaling glare and an InvalidStateError.
+        if (pc.signalingState !== "stable") {
+          console.warn(`Ignoring offer from ${senderName} — signaling state is "${pc.signalingState}", expected "stable"`);
+          return;
         }
+        console.log(`Setting remote offer from ${senderName}`);
+        await pc.setRemoteDescription(new RTCSessionDescription(sessionDesc));
+
+        const answer = await pc.createAnswer();
+        await pc.setLocalDescription(answer);
+        console.log(`Sending answer to ${senderName}`);
+        sendEvent("webrtc_signal", { sdp: answer }, senderId);
+
+        // Flush any ICE candidates that arrived before the remote description was set
+        await flushPendingIceCandidates(senderId, senderName, pc);
       } catch (err) {
         console.error(`Error handling WebRTC offer from ${senderName}:`, err);
       }
-    } 
+    }
     else if (sessionDesc.type === "answer") {
-      if (pc) {
-        try {
-          // Try to set answer if we sent an offer (check pending offers or state)
-          const hasPendingOffer = pendingOffers[senderId];
-          const isValidAnswerState = pc.signalingState === "have-local-offer";
-           
-          if (hasPendingOffer || isValidAnswerState) {
-            console.log(`Setting remote answer from ${senderName}`);
-            await pc.setRemoteDescription(new RTCSessionDescription(sessionDesc));
-            delete pendingOffers[senderId]; // Clear pending offer
-          } else {
-            console.warn(`Cannot set remote answer from ${senderName} - signaling state is ${pc.signalingState}, no pending offer`);
-          }
-        } catch (err) {
-          console.error(`Error handling WebRTC answer from ${senderName}:`, err);
-        }
-      } else {
+      if (!pc) {
         console.warn(`Received answer from ${senderName} but no peer connection exists`);
+        return;
+      }
+      try {
+        // Answers are only valid when we are in "have-local-offer" state
+        if (pc.signalingState !== "have-local-offer") {
+          console.warn(`Ignoring answer from ${senderName} — signaling state is "${pc.signalingState}", expected "have-local-offer"`);
+          return;
+        }
+        console.log(`Setting remote answer from ${senderName}`);
+        await pc.setRemoteDescription(new RTCSessionDescription(sessionDesc));
+        delete pendingOffers[senderId]; // Clear pending offer tracking
+
+        // Flush any ICE candidates that arrived before the remote description was set
+        await flushPendingIceCandidates(senderId, senderName, pc);
+      } catch (err) {
+        console.error(`Error handling WebRTC answer from ${senderName}:`, err);
       }
     }
-  } 
+  }
   // Receive ICE Candidate
   else if (signalData.candidate) {
-    if (pc) {
-      try {
-        // Only add ICE candidate if connection exists and is in valid state
-        if (pc.signalingState !== "closed") {
-          await pc.addIceCandidate(new RTCIceCandidate(signalData.candidate));
-        }
-      } catch (err) {
-        // Silently ignore duplicate ICE candidates
-        if (!err.message.includes("duplicate")) {
-          console.warn(`Error adding ICE candidate from ${senderName}:`, err.message);
-        }
+    if (!pc || !pc.remoteDescription) {
+      // Remote description not set yet — queue the candidate for later
+      if (!pendingIceCandidates[senderId]) {
+        pendingIceCandidates[senderId] = [];
       }
-    } else {
-      console.warn(`Received ICE candidate from ${senderName} but no peer connection exists`);
+      console.log(`Queuing ICE candidate from ${senderName} (remote description not ready)`);
+      pendingIceCandidates[senderId].push(signalData.candidate);
+      return;
+    }
+
+    try {
+      if (pc.signalingState !== "closed") {
+        await pc.addIceCandidate(new RTCIceCandidate(signalData.candidate));
+        console.log(`Added ICE candidate from ${senderName}`);
+      }
+    } catch (err) {
+      if (!err.message.includes("duplicate")) {
+        console.warn(`Error adding ICE candidate from ${senderName}:`, err.message);
+      }
+    }
+  }
+}
+
+// Drain any ICE candidates that were queued before the remote description was ready
+async function flushPendingIceCandidates(senderId, senderName, pc) {
+  const queued = pendingIceCandidates[senderId];
+  if (!queued || queued.length === 0) return;
+
+  console.log(`Flushing ${queued.length} queued ICE candidate(s) for ${senderName}`);
+  delete pendingIceCandidates[senderId];
+
+  for (const candidate of queued) {
+    try {
+      if (pc.signalingState !== "closed") {
+        await pc.addIceCandidate(new RTCIceCandidate(candidate));
+      }
+    } catch (err) {
+      if (!err.message.includes("duplicate")) {
+        console.warn(`Error flushing ICE candidate for ${senderName}:`, err.message);
+      }
     }
   }
 }
@@ -913,8 +967,9 @@ function removeParticipantCard(targetUserId) {
     delete peerConnections[targetUserId];
   }
 
-  // Clean up pending offer tracking
+  // Clean up pending offer and ICE candidate tracking
   delete pendingOffers[targetUserId];
+  delete pendingIceCandidates[targetUserId];
 
   if (bubbleTimers[targetUserId]) {
     clearTimeout(bubbleTimers[targetUserId]);
