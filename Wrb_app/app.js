@@ -773,7 +773,52 @@ const iceCandidateBuffers = {}; // targetUserId -> RTCIceCandidate[]
 const lastProcessedOfferSdp = {}; // targetUserId -> sdp string
 const offerProcessingLock = {};    // targetUserId -> bool (mutex against concurrent offer handling)
 
-function initiatePeerConnection(targetUserId, targetUserName, isOfferCreator) {
+// TURN credential cache – fetched once per session from the server and reused
+// for all peer connections so we don't hammer the credentials endpoint.
+let cachedIceServers = null;
+let iceServersFetchPromise = null;
+
+/**
+ * Fetch TURN credentials from the server-side endpoint and cache them.
+ * Falls back to STUN-only if the endpoint is unavailable so the app
+ * always works even without a TURN server configured.
+ */
+async function getIceServers() {
+  if (cachedIceServers) return cachedIceServers;
+  // If a fetch is already in-flight, wait for it instead of launching a duplicate.
+  if (iceServersFetchPromise) return iceServersFetchPromise;
+
+  iceServersFetchPromise = (async () => {
+    try {
+      const res = await fetch("/api/turn-credentials", { signal: AbortSignal.timeout(5000) });
+      if (res.ok) {
+        const data = await res.json();
+        if (Array.isArray(data.iceServers) && data.iceServers.length > 0) {
+          cachedIceServers = data.iceServers;
+          console.log("TURN credentials fetched from server:", cachedIceServers.length, "entries");
+          return cachedIceServers;
+        }
+      }
+    } catch (err) {
+      console.warn("Could not fetch TURN credentials from server:", err.message);
+    }
+    // Fallback: multiple STUN servers only. Peers behind symmetric NAT will not
+    // connect, but this is better than crashing the whole call setup.
+    console.warn("Falling back to STUN-only ICE config – peers behind symmetric NAT may fail");
+    cachedIceServers = [
+      { urls: "stun:stun.l.google.com:19302" },
+      { urls: "stun:stun1.l.google.com:19302" },
+      { urls: "stun:stun2.l.google.com:19302" },
+      { urls: "stun:stun.cloudflare.com:3478" },
+      { urls: "stun:stun.stunprotocol.org:3478" }
+    ];
+    return cachedIceServers;
+  })();
+
+  return iceServersFetchPromise;
+}
+
+async function initiatePeerConnection(targetUserId, targetUserName, isOfferCreator) {
   // If PC already exists, don't recreate it - just ensure it has tracks
   if (peerConnections[targetUserId]) {
     console.log(`Peer connection already exists with ${targetUserName}`);
@@ -796,18 +841,12 @@ function initiatePeerConnection(targetUserId, targetUserName, isOfferCreator) {
   // Create placeholder card if it doesn't exist
   createParticipantCardPlaceholder(targetUserId, targetUserName);
 
+  // Fetch TURN credentials dynamically so they are always fresh and valid.
+  // getIceServers() caches the result for the session lifetime.
+  const iceServers = await getIceServers();
+
   const pc = new RTCPeerConnection({
-    iceServers: [
-      // STUN – discovers public IP
-      { urls: "stun:stun.l.google.com:19302" },
-      { urls: "stun:stun1.l.google.com:19302" },
-      { urls: "stun:stun.stunprotocol.org:3478" },
-      // Free TURN – relay fallback when direct UDP is blocked (NAT, firewall)
-      // Provided by Open Relay Project (https://www.metered.ca/tools/openrelay/)
-      { urls: "turn:openrelay.metered.ca:80",  username: "openrelayproject", credential: "openrelayproject" },
-      { urls: "turn:openrelay.metered.ca:443", username: "openrelayproject", credential: "openrelayproject" },
-      { urls: "turn:openrelay.metered.ca:443?transport=tcp", username: "openrelayproject", credential: "openrelayproject" }
-    ],
+    iceServers,
     bundlePolicy: "max-bundle",
     rtcpMuxPolicy: "require",
     iceTransportPolicy: "all"
@@ -883,6 +922,11 @@ function initiatePeerConnection(targetUserId, targetUserName, isOfferCreator) {
         delete peerConnections[targetUserId];
         delete iceCandidateBuffers[targetUserId];
         delete pendingOffers[targetUserId];
+        // FIX Bug 4: also clear the SDP dedup fingerprint and offer mutex so that
+        // a fresh offer from the remote side on the next attempt is not silently
+        // discarded by the stale-SDP dedup check in handleWebRTCSignal.
+        delete lastProcessedOfferSdp[targetUserId];
+        delete offerProcessingLock[targetUserId];
         // Small delay so both sides settle before re-negotiating
         setTimeout(() => {
           if (peerConnections[targetUserId]) return; // already recreated by remote offer
