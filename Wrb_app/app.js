@@ -606,6 +606,7 @@ function handleServerDead(statusMessage) {
   });
   Object.keys(iceCandidateBuffers).forEach(pid => { delete iceCandidateBuffers[pid]; });
   Object.keys(lastProcessedOfferSdp).forEach(pid => { delete lastProcessedOfferSdp[pid]; });
+  Object.keys(offerProcessingLock).forEach(pid => { delete offerProcessingLock[pid]; });
 
   // Remove stale remote video cards
   if (videoGrid) videoGrid.querySelectorAll(".video-card.remote").forEach(c => c.remove());
@@ -664,6 +665,7 @@ function scheduleReconnect() {
       });
       Object.keys(iceCandidateBuffers).forEach(pid => { delete iceCandidateBuffers[pid]; });
   Object.keys(lastProcessedOfferSdp).forEach(pid => { delete lastProcessedOfferSdp[pid]; });
+  Object.keys(offerProcessingLock).forEach(pid => { delete offerProcessingLock[pid]; });
       Object.keys(pendingOffers).forEach(pid => { delete pendingOffers[pid]; });
 
       // Remove stale remote video cards
@@ -732,6 +734,7 @@ const iceCandidateBuffers = {}; // targetUserId -> RTCIceCandidate[]
 // Tracks the SDP fingerprint of the last offer we processed per peer.
 // Identical back-to-back offers from the event queue are silently ignored.
 const lastProcessedOfferSdp = {}; // targetUserId -> sdp string
+const offerProcessingLock = {};    // targetUserId -> bool (mutex against concurrent offer handling)
 
 function initiatePeerConnection(targetUserId, targetUserName, isOfferCreator) {
   // If PC already exists, don't recreate it - just ensure it has tracks
@@ -758,15 +761,19 @@ function initiatePeerConnection(targetUserId, targetUserName, isOfferCreator) {
 
   const pc = new RTCPeerConnection({
     iceServers: [
+      // STUN – discovers public IP
       { urls: "stun:stun.l.google.com:19302" },
       { urls: "stun:stun1.l.google.com:19302" },
-      { urls: "stun:stun2.l.google.com:19302" },
-      { urls: "stun:stun3.l.google.com:19302" },
-      { urls: "stun:stun4.l.google.com:19302" },
-      { urls: "stun:stun.stunprotocol.org:3478" }
+      { urls: "stun:stun.stunprotocol.org:3478" },
+      // Free TURN – relay fallback when direct UDP is blocked (NAT, firewall)
+      // Provided by Open Relay Project (https://www.metered.ca/tools/openrelay/)
+      { urls: "turn:openrelay.metered.ca:80",  username: "openrelayproject", credential: "openrelayproject" },
+      { urls: "turn:openrelay.metered.ca:443", username: "openrelayproject", credential: "openrelayproject" },
+      { urls: "turn:openrelay.metered.ca:443?transport=tcp", username: "openrelayproject", credential: "openrelayproject" }
     ],
     bundlePolicy: "max-bundle",
-    rtcpMuxPolicy: "require"
+    rtcpMuxPolicy: "require",
+    iceTransportPolicy: "all"
   });
 
   peerConnections[targetUserId] = pc;
@@ -903,13 +910,22 @@ async function handleWebRTCSignal(senderId, senderName, signalData) {
     // ── OFFER ──────────────────────────────────────────────────────────────
     if (sessionDesc.type === "offer") {
 
-      // Deduplicate: if we already processed this exact SDP, skip it.
-      // The HTTP event queue re-delivers old signals on every poll until the
-      // server clears them, causing the "Setting remote offer" storm in logs.
       const offerKey = sessionDesc.sdp ? sessionDesc.sdp.slice(0, 120) : "";
+
+      // ① Exact-SDP dedup: server re-delivers the same event every poll cycle.
       if (lastProcessedOfferSdp[senderId] === offerKey) {
-        return; // exact duplicate – already answered this offer
+        return;
       }
+
+      // ② Concurrency mutex: set synchronously before any await so that a
+      //    second invocation from the next 200ms poll tick exits here while
+      //    we are mid-await. Without this, two concurrent calls both see
+      //    "have-local-offer", both call rollback, and the second one then
+      //    hits setLocalDescription in the wrong state.
+      if (offerProcessingLock[senderId]) {
+        return;
+      }
+      offerProcessingLock[senderId] = true;
 
       // Create peer connection if this is the first contact from this peer
       if (!pc) {
@@ -917,34 +933,39 @@ async function handleWebRTCSignal(senderId, senderName, signalData) {
       }
 
       try {
-        // GLARE: both sides sent an offer at the same time.
-        // Roll back ours so we can accept the remote one.
+        // GLARE: we sent an offer at the same time as the remote.
+        // Deterministic tie-break: the peer with the lexicographically SMALLER
+        // userId yields (rolls back) so only one side ends up as answerer.
         if (pc.signalingState === "have-local-offer") {
-          console.log(`Glare with ${senderName} – rolling back our offer`);
-          await pc.setLocalDescription({ type: "rollback" });
-          // After rollback, signalingState is "stable" – fall through below
+          if (userId < senderId) {
+            // We yield – roll back our offer and accept theirs
+            console.log(`Glare with ${senderName} – we yield, rolling back our offer`);
+            await pc.setLocalDescription({ type: "rollback" });
+          } else {
+            // They should yield – discard their offer, keep ours
+            console.log(`Glare with ${senderName} – they yield, keeping our offer`);
+            delete offerProcessingLock[senderId];
+            return;
+          }
         }
 
         if (pc.signalingState === "have-remote-offer") {
-          // We're already processing an offer from this peer (async race).
-          // The currently-in-flight handling will finish; ignore this duplicate.
-          console.log(`Already processing offer from ${senderName} – skipping duplicate`);
+          // Already mid-negotiation with a prior offer from this same peer.
+          console.log(`Mid-negotiation with ${senderName} – skipping duplicate offer`);
+          delete offerProcessingLock[senderId];
           return;
         }
 
         if (pc.signalingState !== "stable") {
-          console.warn(`Cannot accept offer from ${senderName} in state ${pc.signalingState}`);
+          console.warn(`Cannot accept offer from ${senderName} in state: ${pc.signalingState}`);
+          delete offerProcessingLock[senderId];
           return;
         }
 
-        // Mark this offer as being processed BEFORE any await so a second
-        // concurrent call (same offer, next poll tick) exits early above.
+        // Record before awaiting so re-entrant calls hit the dedup check above
         lastProcessedOfferSdp[senderId] = offerKey;
 
-        console.log(`Setting remote offer from ${senderName}`);
         await pc.setRemoteDescription(new RTCSessionDescription(sessionDesc));
-
-        // Drain candidates that arrived before the remote description was set
         await drainIceCandidateBuffer(senderId);
 
         const answer = await pc.createAnswer();
@@ -953,9 +974,10 @@ async function handleWebRTCSignal(senderId, senderName, signalData) {
         sendEvent("webrtc_signal", { sdp: pc.localDescription }, senderId);
 
       } catch (err) {
-        // On error, clear the dedup key so we can retry on the next offer
         delete lastProcessedOfferSdp[senderId];
         console.error(`Error handling offer from ${senderName}:`, err.message);
+      } finally {
+        delete offerProcessingLock[senderId];
       }
     }
 
@@ -1126,6 +1148,7 @@ function removeParticipantCard(targetUserId) {
   // Clean up ICE buffer and SDP dedup
   delete iceCandidateBuffers[targetUserId];
   delete lastProcessedOfferSdp[targetUserId];
+  delete offerProcessingLock[targetUserId];
 
   // Clean up pending offer tracking
   delete pendingOffers[targetUserId];
