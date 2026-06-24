@@ -760,6 +760,14 @@ function handleReceivedEvent(event) {
     case "webrtc_signal":
       handleWebRTCSignal(sender, sender_name, data);
       break;
+
+    case "webrtc_reset":
+      // The remote peer is tearing down and rebuilding their RTCPeerConnection.
+      // We must do the same so that when their fresh offer arrives our PC also
+      // has fresh ICE credentials — answering a new offer with an old PC causes
+      // immediate ICE failure (stale ufrag/pwd mismatch).
+      handleWebRTCReset(sender, sender_name);
+      break;
   }
 }
 
@@ -911,6 +919,11 @@ async function initiatePeerConnection(targetUserId, targetUserName, isOfferCreat
         // when using HTTP polling as the signaling transport.
         console.log(`Rebuilding peer connection with ${targetUserName} (attempt ${attempts})…`);
 
+        // Notify the remote peer that we are resetting so they also tear down
+        // their old RTCPeerConnection. Without this they answer our fresh offer
+        // with their stale PC (old ICE ufrag/pwd) → immediate ICE failure.
+        sendEvent("webrtc_reset", {}, targetUserId);
+
         // FIX: null out the stale srcObject before teardown so the new connection's
         // ontrack handler always triggers a fresh video.srcObject assignment.
         const card = document.getElementById(`video-card-${targetUserId}`);
@@ -928,10 +941,14 @@ async function initiatePeerConnection(targetUserId, targetUserName, isOfferCreat
         // discarded by the stale-SDP dedup check in handleWebRTCSignal.
         delete lastProcessedOfferSdp[targetUserId];
         delete offerProcessingLock[targetUserId];
+        // On reconnect always become the offer creator regardless of the original
+        // role. This prevents waiting forever for a remote offer that won't arrive
+        // from a peer whose old PC is still alive. Glare resolution handles both
+        // sides sending offers simultaneously.
         // Small delay so both sides settle before re-negotiating
         setTimeout(() => {
           if (peerConnections[targetUserId]) return; // already recreated by remote offer
-          initiatePeerConnection(targetUserId, targetUserName, isOfferCreator); // async, fire-and-forget inside setTimeout
+          initiatePeerConnection(targetUserId, targetUserName, true); // always offer on reconnect
         }, 800 * attempts);
       } else {
         console.error(`Giving up on ${targetUserName} after ${maxAttempts} attempts`);
@@ -965,7 +982,14 @@ async function initiatePeerConnection(targetUserId, targetUserName, isOfferCreat
       offerSent = true;
       try {
         console.log(`Creating offer for ${targetUserName}`);
-        const offer = await pc.createOffer({ offerToReceiveAudio: true, offerToReceiveVideo: true });
+        // Use iceRestart:true on reconnect attempts so the remote peer's ICE agent
+        // is forced to restart even if they haven't rebuilt their RTCPeerConnection.
+        const isReconnect = (connectionAttemptCounts[targetUserId] || 0) > 0;
+        const offer = await pc.createOffer({
+          offerToReceiveAudio: true,
+          offerToReceiveVideo: true,
+          iceRestart: isReconnect
+        });
         if (pc.signalingState !== "stable") {
           console.warn(`State changed to ${pc.signalingState} during offer creation; aborting`);
           offerSent = false; // allow retry
@@ -1009,6 +1033,35 @@ async function drainIceCandidateBuffer(targetUserId) {
   iceCandidateBuffers[targetUserId] = [];
 }
 
+/**
+ * Called when a remote peer signals that it is tearing down its RTCPeerConnection
+ * and will send a fresh offer. We tear down our side too so both ends start with
+ * clean ICE credentials. Without this, answering a new offer with a stale old PC
+ * causes an immediate ICE failure because the ufrag/pwd in the answer don't match
+ * the new session.
+ */
+function handleWebRTCReset(senderId, senderName) {
+  console.log(`Received webrtc_reset from ${senderName} – tearing down our side`);
+
+  const pc = peerConnections[senderId];
+  if (pc) {
+    const card = document.getElementById(`video-card-${senderId}`);
+    if (card) {
+      const video = card.querySelector("video");
+      if (video) video.srcObject = null;
+    }
+    try { pc.close(); } catch (_) {}
+  }
+
+  delete peerConnections[senderId];
+  delete iceCandidateBuffers[senderId];
+  delete pendingOffers[senderId];
+  delete lastProcessedOfferSdp[senderId];
+  delete offerProcessingLock[senderId];
+  // Do NOT delete connectionAttemptCounts — the remote side manages its own counter.
+  // Do NOT call initiatePeerConnection here — wait for the remote's fresh offer to arrive.
+}
+
 async function handleWebRTCSignal(senderId, senderName, signalData) {
   let pc = peerConnections[senderId];
 
@@ -1047,8 +1100,12 @@ async function handleWebRTCSignal(senderId, senderName, signalData) {
         // userId yields (rolls back) so only one side ends up as answerer.
         if (pc.signalingState === "have-local-offer") {
           if (userId < senderId) {
-            // We yield – roll back our offer and accept theirs
+            // We yield – roll back our offer and accept theirs.
+            // Mark that we rolled back so the stale answer to our old offer
+            // (which may still be in the polling queue) is silently dropped
+            // in the answer handler rather than throwing a "wrong state" error.
             console.log(`Glare with ${senderName} – we yield, rolling back our offer`);
+            delete pendingOffers[senderId]; // our offer is now void
             await pc.setLocalDescription({ type: "rollback" });
           } else {
             // They should yield – discard their offer, keep ours
@@ -1093,7 +1150,8 @@ async function handleWebRTCSignal(senderId, senderName, signalData) {
     // ── ANSWER ─────────────────────────────────────────────────────────────
     else if (sessionDesc.type === "answer") {
       if (!pc) {
-        console.warn(`Answer from ${senderName} but no peer connection – ignoring`);
+        // No PC means we tore it down already (e.g. after a reset) – safe to drop.
+        console.log(`Answer from ${senderName} but no peer connection – ignoring`);
         return;
       }
       if (pc.signalingState === "have-local-offer") {
@@ -1103,10 +1161,18 @@ async function handleWebRTCSignal(senderId, senderName, signalData) {
           delete pendingOffers[senderId];
           await drainIceCandidateBuffer(senderId);
         } catch (err) {
-          console.error(`Error handling answer from ${senderName}:`, err.message);
+          // "Called in wrong state: stable" means a glare rollback completed between
+          // our signalingState check and the await — the answer is stale, safe to drop.
+          const isGlareRace = err.message.includes("wrong state") || err.message.includes("stable");
+          if (isGlareRace) {
+            console.log(`Dropping stale answer from ${senderName} (glare race – state already stable)`);
+          } else {
+            console.error(`Error handling answer from ${senderName}:`, err.message);
+          }
         }
       } else {
-        // stable = already applied; anything else = stale replay – both are safe to drop
+        // stable = already applied via glare rollback; anything else = stale replay.
+        // Both cases are safe to silently drop.
         console.log(`Ignoring answer from ${senderName} in state ${pc.signalingState}`);
       }
     }
