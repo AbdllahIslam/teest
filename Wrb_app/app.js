@@ -25,6 +25,7 @@ let roomId = "";
 let userId = "";
 let username = "";
 let lastEventId = 0;
+let reconnectEventFloor = 0; // discard events older than this after a reconnect
 
 // Media streams
 let localStream = null;
@@ -479,7 +480,7 @@ async function leaveMeeting() {
 function startSyncIntervals() {
   // Sync events more frequently for faster signal exchange when multiple users join
   // This ensures ICE candidates and SDP messages are not delayed
-  pollInterval = setInterval(pollEvents, 500);
+  pollInterval = setInterval(pollEvents, 200);
   
   // Heartbeat every 4 seconds
   heartbeatInterval = setInterval(sendHeartbeat, 4000);
@@ -563,11 +564,18 @@ async function pollEvents() {
 
     const data = await response.json();
     if (data.events && data.events.length > 0) {
-      console.log(`Received ${data.events.length} events`);
-      data.events.forEach(event => {
-        handleReceivedEvent(event);
-        lastEventId = Math.max(lastEventId, event.id);
-      });
+      // After a reconnect, skip events we already processed (or that pre-date our rejoin)
+      const fresh = data.events.filter(e => e.id > reconnectEventFloor);
+      if (fresh.length > 0) {
+        console.log(`Received ${fresh.length} new events (${data.events.length - fresh.length} stale skipped)`);
+        fresh.forEach(event => {
+          handleReceivedEvent(event);
+          lastEventId = Math.max(lastEventId, event.id);
+        });
+      }
+      // Always advance lastEventId to avoid re-fetching skipped events
+      data.events.forEach(e => { lastEventId = Math.max(lastEventId, e.id); });
+      reconnectEventFloor = 0; // clear after first successful post-reconnect poll
     }
   } catch (err) {
     pollFailureCount++;
@@ -636,13 +644,28 @@ function scheduleReconnect() {
 
       const data = await response.json();
       userId = data.user_id; // server may issue a new ID after restart
-      lastEventId = 0;
+      // Use the server's current event cursor so we don't replay stale history.
+      // If the server returns current_event_id use it; otherwise default to 0
+      // but mark that we should skip events older than "now".
+      lastEventId = typeof data.current_event_id === "number" ? data.current_event_id : 0;
+      reconnectEventFloor = lastEventId; // discard anything ≤ this on first poll
       serverDead = false;
       reconnectAttempt = 0;
       if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
 
       if (roomHeaderStatus) roomHeaderStatus.textContent = "Connected";
       console.log("Reconnected. Re-establishing peer connections…");
+
+      // Tear down any lingering peer connections before re-offering
+      Object.keys(peerConnections).forEach(pid => {
+        try { peerConnections[pid].close(); } catch (_) {}
+        delete peerConnections[pid];
+      });
+      Object.keys(iceCandidateBuffers).forEach(pid => { delete iceCandidateBuffers[pid]; });
+      Object.keys(pendingOffers).forEach(pid => { delete pendingOffers[pid]; });
+
+      // Remove stale remote video cards
+      if (videoGrid) videoGrid.querySelectorAll(".video-card.remote").forEach(c => c.remove());
 
       // Re-offer WebRTC to every participant the server knows about
       if (Array.isArray(data.participants)) {
@@ -778,10 +801,20 @@ function initiatePeerConnection(targetUserId, targetUserName, isOfferCreator) {
       connectionAttempts++;
       console.warn(`Connection failed with ${targetUserName} (attempt ${connectionAttempts}/${maxConnectionAttempts})`);
       if (connectionAttempts < maxConnectionAttempts) {
-        console.log(`Restarting ICE with ${targetUserName}...`);
-        pc.restartIce();
+        // Full peer teardown + fresh offer is far more reliable than restartIce
+        // when using HTTP polling as the signaling transport.
+        console.log(`Rebuilding peer connection with ${targetUserName} (attempt ${connectionAttempts})…`);
+        try { pc.close(); } catch (_) {}
+        delete peerConnections[targetUserId];
+        delete iceCandidateBuffers[targetUserId];
+        delete pendingOffers[targetUserId];
+        // Small delay so both sides settle before re-negotiating
+        setTimeout(() => {
+          if (peerConnections[targetUserId]) return; // already recreated by remote offer
+          initiatePeerConnection(targetUserId, targetUserName, isOfferCreator);
+        }, 800 * connectionAttempts);
       } else {
-        console.error(`Giving up connecting with ${targetUserName} after ${maxConnectionAttempts} attempts`);
+        console.error(`Giving up on ${targetUserName} after ${maxConnectionAttempts} attempts`);
       }
     } else if (state === "connected") {
       console.log(`✓ Successfully connected with ${targetUserName}`);
@@ -800,21 +833,21 @@ function initiatePeerConnection(targetUserId, targetUserName, isOfferCreator) {
   // Only the designated offer-creator sends the initial offer.
   // We use onnegotiationneeded ONLY (no extra setTimeout) to avoid double-offer races.
   if (isOfferCreator) {
-    let offerInFlight = false;
+    let offerSent = false; // Only one offer per peer connection lifetime
 
     pc.onnegotiationneeded = async () => {
-      if (offerInFlight) return; // guard against re-entrant calls
-      offerInFlight = true;
+      if (offerSent) return;           // already negotiated this connection
+      if (pc.signalingState !== "stable") {
+        console.warn(`onnegotiationneeded skipped – state is ${pc.signalingState}`);
+        return;
+      }
+      offerSent = true;
       try {
-        if (pc.signalingState !== "stable") {
-          console.warn(`onnegotiationneeded skipped – state is ${pc.signalingState}`);
-          return;
-        }
         console.log(`Creating offer for ${targetUserName}`);
         const offer = await pc.createOffer({ offerToReceiveAudio: true, offerToReceiveVideo: true });
         if (pc.signalingState !== "stable") {
-          // State changed while we were awaiting — abort to avoid InvalidStateError
-          console.warn(`Signaling state changed to ${pc.signalingState} during offer; aborting`);
+          console.warn(`State changed to ${pc.signalingState} during offer creation; aborting`);
+          offerSent = false; // allow retry
           return;
         }
         await pc.setLocalDescription(offer);
@@ -823,8 +856,7 @@ function initiatePeerConnection(targetUserId, targetUserName, isOfferCreator) {
         sendEvent("webrtc_signal", { sdp: pc.localDescription }, targetUserId);
       } catch (err) {
         console.error("Error creating WebRTC offer:", err);
-      } finally {
-        offerInFlight = false;
+        offerSent = false; // allow retry on error
       }
     };
   }
@@ -906,6 +938,9 @@ async function handleWebRTCSignal(senderId, senderName, signalData) {
 
             // Drain buffered ICE candidates now that remote description is set
             await drainIceCandidateBuffer(senderId);
+          } else if (pc.signalingState === "stable") {
+            // Already negotiated – this is a replayed stale answer, safely ignore
+            console.log(`Ignoring stale answer from ${senderName} (already stable)`);
           } else {
             console.warn(`Cannot set remote answer from ${senderName} – signaling state is ${pc.signalingState}`);
           }
