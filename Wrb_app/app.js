@@ -51,6 +51,7 @@ let pendingPrediction = { word: "", count: 0 };
 // Peer connections (WebRTC Mesh)
 const peerConnections = {}; // targetUserId -> RTCPeerConnection
 const pendingOffers = {}; // targetUserId -> true (tracks who we sent offers to)
+const connectionAttemptCounts = {}; // targetUserId -> number (persists across reconnect calls)
 
 // Speech bubble timers
 const bubbleTimers = {}; // userId -> setTimeout ID
@@ -813,8 +814,9 @@ function initiatePeerConnection(targetUserId, targetUserName, isOfferCreator) {
   });
 
   peerConnections[targetUserId] = pc;
-  let connectionAttempts = 0;
-  const maxConnectionAttempts = 3;
+  // connectionAttemptCounts[targetUserId] is intentionally NOT reset here so the
+  // count survives across recursive initiatePeerConnection calls on reconnect.
+  if (!connectionAttemptCounts[targetUserId]) connectionAttemptCounts[targetUserId] = 0;
 
   // Add our local tracks to the connection
   if (localStream) {
@@ -834,9 +836,18 @@ function initiatePeerConnection(targetUserId, targetUserName, isOfferCreator) {
   };
 
   // Remote track received callback
+  // FIX: e.streams[0] can be undefined when the browser delivers a track without
+  // an associated stream (common with certain codecs / Chrome versions). Build a
+  // fallback MediaStream from the raw track so audio/video is never silently lost.
   pc.ontrack = (e) => {
     console.log(`Received remote track from ${targetUserName}:`, e.track.kind);
-    const remoteStream = e.streams[0];
+    const remoteStream = (e.streams && e.streams[0])
+      ? e.streams[0]
+      : (() => {
+          if (!pc._remoteStream) pc._remoteStream = new MediaStream();
+          pc._remoteStream.addTrack(e.track);
+          return pc._remoteStream;
+        })();
     addRemoteParticipantCard(targetUserId, targetUserName, remoteStream);
   };
 
@@ -846,12 +857,28 @@ function initiatePeerConnection(targetUserId, targetUserName, isOfferCreator) {
     console.log(`Connection state with ${targetUserName}: ${state}`);
 
     if (state === "failed") {
-      connectionAttempts++;
-      console.warn(`Connection failed with ${targetUserName} (attempt ${connectionAttempts}/${maxConnectionAttempts})`);
-      if (connectionAttempts < maxConnectionAttempts) {
+      // FIX: use the persistent connectionAttemptCounts map instead of a local
+      // variable. The old local `connectionAttempts` was re-created at 0 on every
+      // recursive call to initiatePeerConnection, so the max-attempts guard never
+      // triggered and failed peers retried indefinitely.
+      connectionAttemptCounts[targetUserId]++;
+      const attempts = connectionAttemptCounts[targetUserId];
+      const maxAttempts = 3;
+      console.warn(`Connection failed with ${targetUserName} (attempt ${attempts}/${maxAttempts})`);
+
+      if (attempts < maxAttempts) {
         // Full peer teardown + fresh offer is far more reliable than restartIce
         // when using HTTP polling as the signaling transport.
-        console.log(`Rebuilding peer connection with ${targetUserName} (attempt ${connectionAttempts})…`);
+        console.log(`Rebuilding peer connection with ${targetUserName} (attempt ${attempts})…`);
+
+        // FIX: null out the stale srcObject before teardown so the new connection's
+        // ontrack handler always triggers a fresh video.srcObject assignment.
+        const card = document.getElementById(`video-card-${targetUserId}`);
+        if (card) {
+          const video = card.querySelector("video");
+          if (video) video.srcObject = null;
+        }
+
         try { pc.close(); } catch (_) {}
         delete peerConnections[targetUserId];
         delete iceCandidateBuffers[targetUserId];
@@ -860,13 +887,14 @@ function initiatePeerConnection(targetUserId, targetUserName, isOfferCreator) {
         setTimeout(() => {
           if (peerConnections[targetUserId]) return; // already recreated by remote offer
           initiatePeerConnection(targetUserId, targetUserName, isOfferCreator);
-        }, 800 * connectionAttempts);
+        }, 800 * attempts);
       } else {
-        console.error(`Giving up on ${targetUserName} after ${maxConnectionAttempts} attempts`);
+        console.error(`Giving up on ${targetUserName} after ${maxAttempts} attempts`);
+        connectionAttemptCounts[targetUserId] = 0; // reset so a future manual rejoin works
       }
     } else if (state === "connected") {
       console.log(`✓ Successfully connected with ${targetUserName}`);
-      connectionAttempts = 0;
+      connectionAttemptCounts[targetUserId] = 0; // reset on success
     }
   };
 
@@ -1186,8 +1214,9 @@ function removeParticipantCard(targetUserId) {
   delete lastProcessedOfferSdp[targetUserId];
   delete offerProcessingLock[targetUserId];
 
-  // Clean up pending offer tracking
+  // Clean up pending offer tracking and connection attempt counter
   delete pendingOffers[targetUserId];
+  delete connectionAttemptCounts[targetUserId];
 
   if (bubbleTimers[targetUserId]) {
     clearTimeout(bubbleTimers[targetUserId]);
