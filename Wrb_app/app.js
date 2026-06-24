@@ -412,6 +412,7 @@ async function leaveMeeting() {
   // Cancel any pending reconnect so an intentional leave never auto-rejoins
   serverDead = false;
   reconnectAttempt = 0;
+  reconnectInProgress = false;
   if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
 
   // Notify server
@@ -477,18 +478,39 @@ async function leaveMeeting() {
   startLobbyPreview();
 }
 
+// Tracks whether a poll fetch is already in-flight so we never run two concurrently
+let pollInFlight = false;
+// Current adaptive poll delay (ms). Speeds up when healthy, slows down under stress.
+let currentPollDelay = 300;
+const POLL_DELAY_MIN = 200;
+const POLL_DELAY_MAX = 3000;
+
 function startSyncIntervals() {
-  // Sync events more frequently for faster signal exchange when multiple users join
-  // This ensures ICE candidates and SDP messages are not delayed
-  pollInterval = setInterval(pollEvents, 200);
-  
-  // Heartbeat every 4 seconds
+  stopSyncIntervals(); // clear any existing timers first
+  currentPollDelay = POLL_DELAY_MIN;
+  schedulePoll();
   heartbeatInterval = setInterval(sendHeartbeat, 4000);
 }
 
 function stopSyncIntervals() {
-  clearInterval(pollInterval);
+  if (pollInterval) { clearTimeout(pollInterval); pollInterval = null; }
   clearInterval(heartbeatInterval);
+  pollInFlight = false;
+}
+
+// Schedule the next poll using a timeout (not interval) so:
+//  1. Two polls can never overlap (no concurrent fetches)
+//  2. The delay can adapt based on network health
+function schedulePoll() {
+  if (pollInterval) clearTimeout(pollInterval);
+  pollInterval = setTimeout(async () => {
+    if (!roomId || !userId || serverDead) return;
+    if (!pollInFlight) {
+      pollInFlight = true;
+      try { await pollEvents(); } finally { pollInFlight = false; }
+    }
+    if (!serverDead) schedulePoll(); // reschedule only if still alive
+  }, currentPollDelay);
 }
 
 async function sendHeartbeat() {
@@ -531,56 +553,54 @@ async function sendEvent(eventType, eventData = {}, recipient = null) {
 // ==========================================================================
 
 async function pollEvents() {
-  if (!roomId || !userId) return;
-  if (serverDead) return; // paused; scheduleReconnect handles wakeup
+  if (!roomId || !userId || serverDead) return;
 
   try {
-    const response = await fetch(`/api/rooms/${roomId}/events?user_id=${userId}&last_event_id=${lastEventId}`, {
-      signal: AbortSignal.timeout(5000)
-    });
+    const response = await fetch(
+      `/api/rooms/${roomId}/events?user_id=${userId}&last_event_id=${lastEventId}`,
+      { signal: AbortSignal.timeout(4000) }
+    );
 
     if (response.status === 404 || response.status === 410) {
-      console.warn(`Room gone (${response.status}) – server likely restarted. Will attempt to rejoin.`);
       handleServerDead("Server restarted – reconnecting…");
       return;
     }
 
     if (response.status === 502 || response.status === 503 || response.status === 504) {
       pollFailureCount++;
-      console.warn(`Server unavailable (${response.status}), failure #${pollFailureCount}`);
+      // Slow down before declaring dead – back off the poll rate first
+      currentPollDelay = Math.min(currentPollDelay * 2, POLL_DELAY_MAX);
       if (pollFailureCount >= 3) handleServerDead("Server unavailable – reconnecting…");
       return;
     }
 
     if (!response.ok) {
       pollFailureCount++;
-      console.warn(`Unexpected poll error (${response.status})`);
+      currentPollDelay = Math.min(currentPollDelay * 1.5, POLL_DELAY_MAX);
       return;
     }
 
-    // Success
+    // ── Success: restore fast polling, reset failure counter ─────────────────
     pollFailureCount = 0;
-    if (serverDead) { serverDead = false; reconnectAttempt = 0; }
+    currentPollDelay = POLL_DELAY_MIN;
 
     const data = await response.json();
     if (data.events && data.events.length > 0) {
-      // After a reconnect, skip events we already processed (or that pre-date our rejoin)
       const fresh = data.events.filter(e => e.id > reconnectEventFloor);
       if (fresh.length > 0) {
-        console.log(`Received ${fresh.length} new events (${data.events.length - fresh.length} stale skipped)`);
         fresh.forEach(event => {
           handleReceivedEvent(event);
           lastEventId = Math.max(lastEventId, event.id);
         });
       }
-      // Always advance lastEventId to avoid re-fetching skipped events
       data.events.forEach(e => { lastEventId = Math.max(lastEventId, e.id); });
-      reconnectEventFloor = 0; // clear after first successful post-reconnect poll
+      reconnectEventFloor = 0;
     }
   } catch (err) {
     pollFailureCount++;
     const isTimeout = err.name === "AbortError" || err.name === "TimeoutError";
-    console.warn(isTimeout ? `Poll timed out (#${pollFailureCount})` : `Polling error: ${err.message}`);
+    // Back off poll rate on timeouts to avoid amplifying a congested network
+    currentPollDelay = Math.min(currentPollDelay * (isTimeout ? 2 : 1.5), POLL_DELAY_MAX);
     const threshold = isTimeout ? 5 : 3;
     if (pollFailureCount >= threshold) handleServerDead("Connection lost – reconnecting…");
   }
@@ -592,9 +612,12 @@ async function pollEvents() {
  * exponential-backoff rejoin attempt.
  */
 function handleServerDead(statusMessage) {
-  if (serverDead) return;
+  if (serverDead) return;  // already handling – ignore duplicate triggers from in-flight polls
   serverDead = true;
   pollFailureCount = 0;
+
+  // Stop the poll loop immediately so no more requests fire while we reconnect
+  if (pollInterval) { clearTimeout(pollInterval); pollInterval = null; }
 
   if (roomHeaderStatus) roomHeaderStatus.textContent = statusMessage;
   console.warn("handleServerDead:", statusMessage);
@@ -619,9 +642,11 @@ function handleServerDead(statusMessage) {
  * WebRTC to all existing participants.
  * Backoff: 2s → 3s → 4.5s … capped at 15s.
  */
+let reconnectInProgress = false; // prevents two parallel reconnect fetches
+
 function scheduleReconnect() {
   if (reconnectTimer) clearTimeout(reconnectTimer);
-  if (!roomId || !username) return; // User already left intentionally
+  if (!roomId || !username) return;
 
   const delay = Math.min(BASE_RECONNECT_DELAY_MS * Math.pow(1.5, reconnectAttempt), MAX_RECONNECT_DELAY_MS);
   reconnectAttempt++;
@@ -629,56 +654,67 @@ function scheduleReconnect() {
 
   reconnectTimer = setTimeout(async () => {
     if (!roomId || !username) return;
+    // Hard guard: if a reconnect fetch is already running, do nothing.
+    // handleServerDead may be called multiple times from in-flight polls.
+    if (reconnectInProgress) {
+      console.log("Reconnect already in progress – skipping duplicate");
+      return;
+    }
+    reconnectInProgress = true;
     if (roomHeaderStatus) roomHeaderStatus.textContent = `Reconnecting… (attempt ${reconnectAttempt})`;
 
     try {
       const response = await fetch("/api/rooms/join", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ room_id: roomId, username: username })
+        body: JSON.stringify({ room_id: roomId, username: username }),
+        signal: AbortSignal.timeout(8000)
       });
 
       if (!response.ok) {
         console.warn(`Rejoin failed (${response.status}), retrying…`);
+        reconnectInProgress = false;
         scheduleReconnect();
         return;
       }
 
       const data = await response.json();
-      userId = data.user_id; // server may issue a new ID after restart
-      // Use the server's current event cursor so we don't replay stale history.
-      // If the server returns current_event_id use it; otherwise default to 0
-      // but mark that we should skip events older than "now".
-      lastEventId = typeof data.current_event_id === "number" ? data.current_event_id : 0;
-      reconnectEventFloor = lastEventId; // discard anything ≤ this on first poll
+      userId = data.user_id;
+      lastEventId = typeof data.current_event_id === "number" ? data.current_event_id : lastEventId;
+      reconnectEventFloor = lastEventId;
       serverDead = false;
       reconnectAttempt = 0;
+      reconnectInProgress = false;
       if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
 
       if (roomHeaderStatus) roomHeaderStatus.textContent = "Connected";
       console.log("Reconnected. Re-establishing peer connections…");
 
-      // Tear down any lingering peer connections before re-offering
+      // Full teardown before re-offering – prevents duplicate peer connections
       Object.keys(peerConnections).forEach(pid => {
         try { peerConnections[pid].close(); } catch (_) {}
         delete peerConnections[pid];
       });
       Object.keys(iceCandidateBuffers).forEach(pid => { delete iceCandidateBuffers[pid]; });
-  Object.keys(lastProcessedOfferSdp).forEach(pid => { delete lastProcessedOfferSdp[pid]; });
-  Object.keys(offerProcessingLock).forEach(pid => { delete offerProcessingLock[pid]; });
+      Object.keys(lastProcessedOfferSdp).forEach(pid => { delete lastProcessedOfferSdp[pid]; });
+      Object.keys(offerProcessingLock).forEach(pid => { delete offerProcessingLock[pid]; });
       Object.keys(pendingOffers).forEach(pid => { delete pendingOffers[pid]; });
-
-      // Remove stale remote video cards
       if (videoGrid) videoGrid.querySelectorAll(".video-card.remote").forEach(c => c.remove());
 
-      // Re-offer WebRTC to every participant the server knows about
+      // Re-offer to all current participants, then restart the poll loop
       if (Array.isArray(data.participants)) {
         data.participants.forEach(p => {
           if (p.id !== userId) initiatePeerConnection(p.id, p.name, true);
         });
       }
+
+      // Restart polling at normal speed now that we're back
+      currentPollDelay = POLL_DELAY_MIN;
+      schedulePoll();
+
     } catch (err) {
       console.warn("Rejoin error:", err.message);
+      reconnectInProgress = false;
       scheduleReconnect();
     }
   }, delay);
