@@ -58,7 +58,13 @@ const bubbleTimers = {}; // userId -> setTimeout ID
 let pollInterval = null;
 let heartbeatInterval = null;
 let pollFailureCount = 0;
-const maxPollBackoff = 5000; // 5 seconds max
+
+// Reconnect state
+let serverDead = false;          // true while we're getting 404/502
+let reconnectTimer = null;
+let reconnectAttempt = 0;
+const MAX_RECONNECT_DELAY_MS = 15000;
+const BASE_RECONNECT_DELAY_MS = 2000;
 
 // ==========================================================================
 // DOM ELEMENTS
@@ -402,6 +408,11 @@ async function leaveMeeting() {
   toggleSignRecognition(false);
   stopSyncIntervals();
 
+  // Cancel any pending reconnect so an intentional leave never auto-rejoins
+  serverDead = false;
+  reconnectAttempt = 0;
+  if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+
   // Notify server
   if (roomId && userId) {
     try {
@@ -520,19 +531,35 @@ async function sendEvent(eventType, eventData = {}, recipient = null) {
 
 async function pollEvents() {
   if (!roomId || !userId) return;
+  if (serverDead) return; // paused; scheduleReconnect handles wakeup
+
   try {
     const response = await fetch(`/api/rooms/${roomId}/events?user_id=${userId}&last_event_id=${lastEventId}`, {
-      signal: AbortSignal.timeout(5000) // 5 second timeout
+      signal: AbortSignal.timeout(5000)
     });
-    if (!response.ok) {
-      if (response.status >= 500) {
-        console.warn(`Server error (${response.status}) polling events`);
-        pollFailureCount++;
-      }
+
+    if (response.status === 404 || response.status === 410) {
+      console.warn(`Room gone (${response.status}) – server likely restarted. Will attempt to rejoin.`);
+      handleServerDead("Server restarted – reconnecting…");
       return;
     }
 
-    pollFailureCount = 0; // Reset on success
+    if (response.status === 502 || response.status === 503 || response.status === 504) {
+      pollFailureCount++;
+      console.warn(`Server unavailable (${response.status}), failure #${pollFailureCount}`);
+      if (pollFailureCount >= 3) handleServerDead("Server unavailable – reconnecting…");
+      return;
+    }
+
+    if (!response.ok) {
+      pollFailureCount++;
+      console.warn(`Unexpected poll error (${response.status})`);
+      return;
+    }
+
+    // Success
+    pollFailureCount = 0;
+    if (serverDead) { serverDead = false; reconnectAttempt = 0; }
 
     const data = await response.json();
     if (data.events && data.events.length > 0) {
@@ -543,13 +570,91 @@ async function pollEvents() {
       });
     }
   } catch (err) {
-    if (err.name === "AbortError") {
-      console.warn("Poll request timed out");
-    } else {
-      console.warn("Polling events error:", err.message);
-    }
     pollFailureCount++;
+    const isTimeout = err.name === "AbortError" || err.name === "TimeoutError";
+    console.warn(isTimeout ? `Poll timed out (#${pollFailureCount})` : `Polling error: ${err.message}`);
+    const threshold = isTimeout ? 5 : 3;
+    if (pollFailureCount >= threshold) handleServerDead("Connection lost – reconnecting…");
   }
+}
+
+/**
+ * Called when the server is unreachable or room is gone.
+ * Closes dead peer connections, shows UI status, and schedules an
+ * exponential-backoff rejoin attempt.
+ */
+function handleServerDead(statusMessage) {
+  if (serverDead) return;
+  serverDead = true;
+  pollFailureCount = 0;
+
+  if (roomHeaderStatus) roomHeaderStatus.textContent = statusMessage;
+  console.warn("handleServerDead:", statusMessage);
+
+  // Tear down dead peer connections
+  Object.keys(peerConnections).forEach(pid => {
+    try { peerConnections[pid].close(); } catch (_) {}
+    delete peerConnections[pid];
+  });
+  Object.keys(iceCandidateBuffers).forEach(pid => { delete iceCandidateBuffers[pid]; });
+
+  // Remove stale remote video cards
+  if (videoGrid) videoGrid.querySelectorAll(".video-card.remote").forEach(c => c.remove());
+
+  scheduleReconnect();
+}
+
+/**
+ * Exponential-backoff reconnect: re-joins the same room then re-offers
+ * WebRTC to all existing participants.
+ * Backoff: 2s → 3s → 4.5s … capped at 15s.
+ */
+function scheduleReconnect() {
+  if (reconnectTimer) clearTimeout(reconnectTimer);
+  if (!roomId || !username) return; // User already left intentionally
+
+  const delay = Math.min(BASE_RECONNECT_DELAY_MS * Math.pow(1.5, reconnectAttempt), MAX_RECONNECT_DELAY_MS);
+  reconnectAttempt++;
+  console.log(`Reconnect attempt ${reconnectAttempt} in ${Math.round(delay / 1000)}s…`);
+
+  reconnectTimer = setTimeout(async () => {
+    if (!roomId || !username) return;
+    if (roomHeaderStatus) roomHeaderStatus.textContent = `Reconnecting… (attempt ${reconnectAttempt})`;
+
+    try {
+      const response = await fetch("/api/rooms/join", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ room_id: roomId, username: username })
+      });
+
+      if (!response.ok) {
+        console.warn(`Rejoin failed (${response.status}), retrying…`);
+        scheduleReconnect();
+        return;
+      }
+
+      const data = await response.json();
+      userId = data.user_id; // server may issue a new ID after restart
+      lastEventId = 0;
+      serverDead = false;
+      reconnectAttempt = 0;
+      if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+
+      if (roomHeaderStatus) roomHeaderStatus.textContent = "Connected";
+      console.log("Reconnected. Re-establishing peer connections…");
+
+      // Re-offer WebRTC to every participant the server knows about
+      if (Array.isArray(data.participants)) {
+        data.participants.forEach(p => {
+          if (p.id !== userId) initiatePeerConnection(p.id, p.name, true);
+        });
+      }
+    } catch (err) {
+      console.warn("Rejoin error:", err.message);
+      scheduleReconnect();
+    }
+  }, delay);
 }
 
 function handleReceivedEvent(event) {
