@@ -953,10 +953,12 @@ async function initiatePeerConnection(targetUserId, targetUserName, isOfferCreat
       } else {
         console.error(`Giving up on ${targetUserName} after ${maxAttempts} attempts`);
         connectionAttemptCounts[targetUserId] = 0; // reset so a future manual rejoin works
+        markPeerConnectionDead(targetUserId, targetUserName);
       }
     } else if (state === "connected") {
       console.log(`✓ Successfully connected with ${targetUserName}`);
       connectionAttemptCounts[targetUserId] = 0; // reset on success
+      clearPeerConnectionDead(targetUserId);
     }
   };
 
@@ -1348,6 +1350,38 @@ function updateParticipantMediaUI(targetUserId, mediaType, enabled) {
       micInd.classList.toggle("hidden", enabled);
     }
   }
+}
+
+/**
+ * Shown when a peer connection has exhausted all retry attempts and
+ * is permanently dead. Without this the user has no way to know that
+ * "silence" from a participant is actually a broken connection rather
+ * than the person just not talking — this is most common when two
+ * users are on different networks and TURN relay isn't available.
+ */
+function markPeerConnectionDead(targetUserId, targetUserName) {
+  const card = document.getElementById(`video-card-${targetUserId}`);
+  if (!card) return;
+
+  card.classList.add("connection-dead");
+
+  let badge = card.querySelector(".connection-dead-badge");
+  if (!badge) {
+    badge = document.createElement("div");
+    badge.className = "connection-dead-badge";
+    badge.innerHTML = `⚠️ Connection issue with ${targetUserName}<br><span class="connection-dead-sub">They may not see or hear you. Try rejoining.</span>`;
+    card.appendChild(badge);
+  }
+
+  addSystemMessage(`⚠️ Lost connection to ${targetUserName}. They may not see or hear you.`);
+}
+
+function clearPeerConnectionDead(targetUserId) {
+  const card = document.getElementById(`video-card-${targetUserId}`);
+  if (!card) return;
+  card.classList.remove("connection-dead");
+  const badge = card.querySelector(".connection-dead-badge");
+  if (badge) badge.remove();
 }
 
 // Toggle local camera track

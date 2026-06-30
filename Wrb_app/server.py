@@ -1,4 +1,8 @@
 from pathlib import Path
+import base64
+import hashlib
+import hmac
+import os
 import pickle
 import time
 import uuid
@@ -18,6 +22,14 @@ CLASSES_PATH = BASE_DIR / "classes.pkl"
 
 FRAMES = 15
 NUM_FEATURES = 225
+
+# --- TURN server config -----------------------------------------------
+# Set these via environment variables in production. TURN_SECRET must match
+# the `static-auth-secret` value in /etc/turnserver.conf on the coturn host.
+TURN_SECRET = os.environ.get("TURN_SECRET", "")
+TURN_HOST = os.environ.get("TURN_HOST", "")  # e.g. "turn.yourdomain.com" or an IP
+TURN_TTL_SECONDS = int(os.environ.get("TURN_TTL_SECONDS", "3600"))
+# -------------------------------------------------------------------------
 
 app = Flask(__name__, static_folder=".", static_url_path="")
 CORS(app)
@@ -121,6 +133,58 @@ def cleanup_room(room_id):
     if not room["participants"]:
         print(f"[CLEANUP] Room {room_id} is empty. Deleting room.")
         del ROOMS[room_id]
+
+
+@app.route("/api/turn-credentials", methods=["GET"])
+def turn_credentials():
+    """
+    Generates short-lived TURN credentials using the coturn REST API
+    mechanism (https://github.com/coturn/coturn/wiki/turnserver#turn-rest-api).
+
+    The username is "{expiry_unix_timestamp}:{random}" and the password is
+    HMAC-SHA1(secret, username) base64-encoded. coturn validates this itself
+    using the same static-auth-secret configured in turnserver.conf -- no
+    database or session lookup needed on our side.
+
+    If TURN_SECRET/TURN_HOST aren't configured, we return STUN-only servers.
+    The client already has a STUN fallback, but be aware: STUN alone cannot
+    traverse symmetric NAT, which is the exact bug this endpoint exists to fix.
+    Cross-network calls will not reliably connect until TURN_HOST/TURN_SECRET
+    are set in the environment and coturn is actually running.
+    """
+    if not TURN_SECRET or not TURN_HOST:
+        print("[WARN] TURN_SECRET or TURN_HOST not set - serving STUN-only credentials. "
+              "Cross-network users will likely fail to connect.")
+        return jsonify({
+            "iceServers": [
+                {"urls": "stun:stun.l.google.com:19302"},
+                {"urls": "stun:stun1.l.google.com:19302"},
+            ]
+        })
+
+    expiry = int(time.time()) + TURN_TTL_SECONDS
+    username = f"{expiry}:{uuid.uuid4().hex[:8]}"
+
+    digest = hmac.new(
+        TURN_SECRET.encode("utf-8"),
+        username.encode("utf-8"),
+        hashlib.sha1
+    ).digest()
+    password = base64.b64encode(digest).decode("utf-8")
+
+    return jsonify({
+        "iceServers": [
+            {"urls": f"stun:{TURN_HOST}:3478"},
+            {
+                "urls": [
+                    f"turn:{TURN_HOST}:3478?transport=udp",
+                    f"turn:{TURN_HOST}:3478?transport=tcp",
+                ],
+                "username": username,
+                "credential": password,
+            },
+        ]
+    })
 
 
 @app.route("/")
@@ -354,6 +418,13 @@ if __name__ == "__main__":
     print("Classes:", ACTIONS)
     print("Input shape:", model.input_shape)
     print("Output shape:", model.output_shape)
+    print("-----------------------------------")
+    if TURN_SECRET and TURN_HOST:
+        print(f"[OK] TURN configured: host={TURN_HOST}")
+    else:
+        print("[WARN] TURN_HOST / TURN_SECRET not set in environment.")
+        print("       Cross-network users will fail to connect (STUN-only fallback).")
+        print("       Set TURN_HOST and TURN_SECRET env vars once coturn is running.")
     print("===================================")
 
     port = int(os.environ.get("PORT", 5000))
